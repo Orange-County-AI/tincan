@@ -111,24 +111,40 @@ func writeJSON(path string, v any) error {
 // enqueue spools one message into the target mailbox. The mailbox is created
 // on first send; messages wait until a session mounts it. Never coalesced.
 func enqueue(to, from, body, replyTo string) (*Msg, error) {
-	if err := validName("mailbox", to); err != nil {
-		return nil, err
-	}
-	if err := validName("sender", from); err != nil {
-		return nil, err
-	}
-	if body == "" {
-		return nil, fmt.Errorf("message body is required")
-	}
-	msg := &Msg{ID: randomID(), From: from, To: to, Body: body, ReplyTo: replyTo, QueuedAt: time.Now().UTC()}
-	err := withBoxLock(to, func() error {
-		name := "msg-" + msg.QueuedAt.Format("20060102T150405") + "-" + msg.ID + ".json"
-		return writeJSON(filepath.Join(queueDir(to), name), msg)
-	})
-	if err != nil {
+	msg := &Msg{From: from, To: to, Body: body, ReplyTo: replyTo}
+	if err := enqueueMsg(msg); err != nil {
 		return nil, err
 	}
 	return msg, nil
+}
+
+// enqueueMsg spools a message, honoring a caller-supplied ID/QueuedAt
+// (generated when empty) and deduplicating on ID: re-delivering a message
+// already in the queue is a silent no-op, which makes cross-host retries
+// idempotent when only the delivery acknowledgment was lost.
+func enqueueMsg(msg *Msg) error {
+	if err := validName("mailbox", msg.To); err != nil {
+		return err
+	}
+	if err := validName("sender", msg.From); err != nil {
+		return err
+	}
+	if msg.Body == "" {
+		return fmt.Errorf("message body is required")
+	}
+	if msg.ID == "" {
+		msg.ID = randomID()
+	}
+	if msg.QueuedAt.IsZero() {
+		msg.QueuedAt = time.Now().UTC()
+	}
+	return withBoxLock(msg.To, func() error {
+		if dups, err := filepath.Glob(filepath.Join(queueDir(msg.To), "msg-*-"+msg.ID+".json")); err == nil && len(dups) > 0 {
+			return nil // already queued: duplicate delivery
+		}
+		name := "msg-" + msg.QueuedAt.Format("20060102T150405") + "-" + msg.ID + ".json"
+		return writeJSON(filepath.Join(queueDir(msg.To), name), msg)
+	})
 }
 
 // claimPending atomically claims every spooled message in a mailbox by
@@ -203,12 +219,19 @@ func readPresence(name string) *Presence {
 	return &p
 }
 
-// BoxInfo is one row of the peer directory.
+// BoxInfo is one row of the peer directory. JSON-tagged because
+// `tincan list --json` is the wire format remotePeers reads over ssh.
 type BoxInfo struct {
-	Name      string
-	Listening bool
-	LastSeen  time.Time // zero if never served
-	Pending   int
+	Name      string    `json:"name"`
+	Listening bool      `json:"listening"`
+	LastSeen  time.Time `json:"last_seen,omitzero"` // zero if never served
+	Pending   int       `json:"pending"`
+}
+
+// boxListening reports whether a live serve process is draining the mailbox.
+func boxListening(name string) bool {
+	p := readPresence(name)
+	return p != nil && time.Since(p.UpdatedAt) < presenceFresh && processAlive(p.PID)
 }
 
 func listBoxes() ([]BoxInfo, error) {
