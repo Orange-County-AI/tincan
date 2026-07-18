@@ -126,8 +126,10 @@ func enqueueMsg(msg *Msg) error {
 	if err := validName("mailbox", msg.To); err != nil {
 		return err
 	}
-	if err := validName("sender", msg.From); err != nil {
-		return err
+	// Senders may be host-qualified ("clem@citadel") when the message crossed
+	// hosts; replying to that address routes back over ssh.
+	if !addrRe.MatchString(msg.From) {
+		return fmt.Errorf("invalid sender %q: must match %s", msg.From, addrRe)
 	}
 	if msg.Body == "" {
 		return fmt.Errorf("message body is required")
