@@ -8,8 +8,10 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"time"
 )
@@ -22,7 +24,11 @@ Usage:
   tincan serve                                   run as MCP channel server (stdio);
                                                  drains the TINCAN_MAILBOX mailbox
   tincan send TO MESSAGE [--from NAME] [--reply-to ID]
-  tincan list                                    all mailboxes, listening status, backlog
+                                                 TO is a mailbox, or mailbox@host
+                                                 (ssh alias) for cross-host delivery
+  tincan list [--json]                           all mailboxes, listening status, backlog
+  tincan flush [HOST]                            retry cross-host messages queued in
+                                                 the local outbox
 
 Identity: TINCAN_MAILBOX names this session's mailbox (required for serve,
 default --from for send). Names: lowercase letters, digits, hyphens (max 41 chars).
@@ -45,7 +51,11 @@ func main() {
 	case "send":
 		err = cmdSend(os.Args[2:])
 	case "list":
-		err = cmdList()
+		err = cmdList(os.Args[2:])
+	case "flush":
+		err = cmdFlush(os.Args[2:])
+	case "deliver": // plumbing: remote hosts pipe a Msg JSON into this over ssh
+		err = cmdDeliver()
 	case "version", "--version", "-v":
 		fmt.Println(version)
 	case "help", "--help", "-h":
@@ -78,22 +88,37 @@ func cmdSend(args []string) error {
 	if sender == "" {
 		sender = "cli"
 	}
-	msg, err := enqueue(to, sender, body, *replyTo)
+	msg, status, err := sendTo(to, sender, body, *replyTo)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Message %s spooled to %q from %q.\n", msg.ID, to, sender)
+	fmt.Printf("Message %s to %q from %q: %s.\n", msg.ID, to, msg.From, status)
 	return nil
 }
 
-func cmdList() error {
+func cmdList(args []string) error {
+	fs := flag.NewFlagSet("list", flag.ContinueOnError)
+	jsonOut := fs.Bool("json", false, "machine-readable output (the cross-host wire format)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 	boxes, err := listBoxes()
 	if err != nil {
 		return err
 	}
+	if *jsonOut {
+		if boxes == nil {
+			boxes = []BoxInfo{}
+		}
+		data, err := json.Marshal(boxes)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(data))
+		return nil
+	}
 	if len(boxes) == 0 {
 		fmt.Println("No mailboxes exist yet.")
-		return nil
 	}
 	for _, box := range boxes {
 		status := "never seen listening"
@@ -103,6 +128,49 @@ func cmdList() error {
 			status = "last seen " + box.LastSeen.Local().Format(time.RFC3339)
 		}
 		fmt.Printf("- %s: %s | pending=%d\n", box.Name, status, box.Pending)
+	}
+	for _, host := range outboxHosts() {
+		if n := outboxPending(host); n > 0 {
+			fmt.Printf("outbox: %d queued for %s (tincan flush %s to retry now)\n", n, host, host)
+		}
+	}
+	return nil
+}
+
+// cmdDeliver is the receiving end of cross-host delivery: a Msg as JSON on
+// stdin, enqueued into the local mailbox it names. Silent on success so the
+// ssh exec fast path stays cheap; idempotent on message ID.
+func cmdDeliver() error {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return err
+	}
+	var msg Msg
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return fmt.Errorf("bad message JSON on stdin: %v", err)
+	}
+	return enqueueMsg(&msg)
+}
+
+func cmdFlush(args []string) error {
+	hosts := outboxHosts()
+	if len(args) > 0 {
+		hosts = []string{args[0]}
+	}
+	if len(hosts) == 0 {
+		fmt.Println("Outbox is empty.")
+		return nil
+	}
+	for _, host := range hosts {
+		sent, remaining, err := sweepOutbox(host)
+		switch {
+		case err != nil:
+			fmt.Printf("%s: sent %d, %d still queued (%v)\n", host, sent, remaining, err)
+		case sent == 0 && remaining == 0:
+			fmt.Printf("%s: outbox empty\n", host)
+		default:
+			fmt.Printf("%s: sent %d, outbox clear\n", host, sent)
+		}
 	}
 	return nil
 }
