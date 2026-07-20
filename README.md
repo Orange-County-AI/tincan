@@ -170,6 +170,12 @@ There are two ways to run a non-claude sink:
   a plain foreground process (e.g. a systemd user unit); flags are sugar
   over the same envs.
 
+If a standalone pump owns a mailbox and you *also* want the MCP tools in the
+harness, mount serve with **`CHANNEL_SINK=none`** (tools-only: no draining,
+no presence heartbeat). Never mount a default (claude-sink) serve next to a
+pump: a harness that ignores channel notifications would ack the messages it
+drains into the void.
+
 **OpenCode** — targets a live [`opencode serve`](https://opencode.ai/docs/server/)
 (`OPENCODE_URL`, default `http://127.0.0.1:4096`); each message becomes a
 user turn via `POST /session/{id}/prompt_async`. The target session is

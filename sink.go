@@ -5,6 +5,8 @@ package main
 // same everywhere; only the last hop differs. CHANNEL_SINK selects it:
 //
 //	claude   (default) MCP notifications/claude/channel — Claude Code channels
+//	none               tools-only serve: no draining, no presence; pair with a
+//	                   standalone `tincan pump` that owns delivery ("tools" works too)
 //	opencode           POST {OPENCODE_URL}/session/{id}/prompt_async — pushes a
 //	                   real user turn into a persistent opencode session
 //	hermes             POST {HERMES_WEBHOOK_URL} — a Hermes webhook route (V2
@@ -45,6 +47,13 @@ func newSink(source string, out *stdoutWriter) (sink, error) {
 	switch strings.ToLower(os.Getenv("CHANNEL_SINK")) {
 	case "", "claude":
 		return &claudeSink{out: out}, nil
+	case "none", "tools":
+		// Tools-only: serve exposes send_message/list_peers but never drains
+		// (and never heartbeats presence) — a standalone `tincan pump` owns
+		// delivery for the mailbox. Without this, mounting serve next to a
+		// pump would ack messages into a harness that ignores channel
+		// notifications, silently losing them.
+		return nil, nil
 	case "opencode":
 		return &opencodeSink{
 			base:      strings.TrimRight(envOr("OPENCODE_URL", "http://127.0.0.1:4096"), "/"),

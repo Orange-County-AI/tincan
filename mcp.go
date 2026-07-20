@@ -87,7 +87,11 @@ func serve() error {
 	if err != nil {
 		return err
 	}
-	startPolling := sync.OnceFunc(func() { go drainLoop(mailboxName(), dlv) })
+	startPolling := sync.OnceFunc(func() {
+		if dlv != nil { // nil = tools-only (CHANNEL_SINK=none): a pump owns delivery
+			go drainLoop(mailboxName(), dlv)
+		}
+	})
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)

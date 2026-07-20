@@ -36,9 +36,10 @@ Usage:
                                                  standalone drain of a mailbox into a
                                                  hermes gateway webhook route
 
-Delivery: serve picks its last hop via CHANNEL_SINK (claude|opencode|hermes);
-pump runs the same drain loop without the MCP stdio side, for deployments
-where nothing mounts serve.
+Delivery: serve picks its last hop via CHANNEL_SINK (claude|opencode|hermes,
+or none for tools-only serve alongside a standalone pump); pump runs the same
+drain loop without the MCP stdio side, for deployments where nothing mounts
+serve.
 
 Identity: TINCAN_MAILBOX names this session's mailbox (required for serve,
 default --from for send). Names: lowercase letters, digits, hyphens (max 41 chars).

@@ -172,3 +172,16 @@ func TestDefaultSinkIsClaude(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestNoneSinkIsToolsOnly(t *testing.T) {
+	for _, v := range []string{"none", "tools"} {
+		t.Setenv("CHANNEL_SINK", v)
+		dlv, err := newSink("tincan", &stdoutWriter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dlv != nil {
+			t.Fatalf("CHANNEL_SINK=%s: sink = %T, want nil (no drain loop)", v, dlv)
+		}
+	}
+}
