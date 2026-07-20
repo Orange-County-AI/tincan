@@ -29,12 +29,16 @@ Usage:
   tincan list [--json]                           all mailboxes, listening status, backlog
   tincan flush [HOST]                            retry cross-host messages queued in
                                                  the local outbox
-  tincan pump opencode [--url BASE] [--session ID] [--mailbox NAME]
-                                                 drain a mailbox into a live
-                                                 "opencode serve" session over HTTP
+  tincan pump opencode [--url BASE] [--session ID | --title T] [--mailbox NAME]
+                                                 standalone drain of a mailbox into a
+                                                 live "opencode serve" session over HTTP
   tincan pump hermes --url WEBHOOK_URL [--secret S] [--mailbox NAME]
-                                                 drain a mailbox into a hermes
-                                                 gateway webhook route
+                                                 standalone drain of a mailbox into a
+                                                 hermes gateway webhook route
+
+Delivery: serve picks its last hop via CHANNEL_SINK (claude|opencode|hermes);
+pump runs the same drain loop without the MCP stdio side, for deployments
+where nothing mounts serve.
 
 Identity: TINCAN_MAILBOX names this session's mailbox (required for serve,
 default --from for send). Names: lowercase letters, digits, hyphens (max 41 chars).

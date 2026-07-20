@@ -146,49 +146,74 @@ That's the entire deployment: the remote side is just the `deliver` and
   original is still queued, but consumers should treat `event_id` as the
   idempotency key.
 
-## Other harnesses (`tincan pump`)
+## Other harnesses (`CHANNEL_SINK` / `tincan pump`)
 
 Everything above the last hop — mailbox spool, claim → ack, ssh cross-host,
-outbox retry — is harness-agnostic; only `serve`'s MCP-channel push is
-Claude-Code-specific. `tincan pump` is the alternative delivery head: it
-drains a mailbox exactly like serve (same at-least-once contract, same
-presence heartbeat, so the mailbox shows as `listening` in `list_peers`) but
-injects each backlog into another harness's live session over HTTP. Senders
-never know or care what harness a mailbox fronts.
+outbox retry, presence — is harness-agnostic; only the default MCP-channel
+push is Claude-Code-specific. The last hop is a pluggable **sink**
+(`CHANNEL_SINK=claude|opencode|hermes`, default claude), and messages always
+arrive wrapped in the same `<channel source="tincan" ...>` envelope, so agent
+instructions are portable across harnesses. Senders never know or care what
+harness a mailbox fronts. Delivery through any sink keeps the at-least-once
+contract: a failed delivery leaves the message claimed and it is retried next
+poll, in order.
 
-Messages arrive in the same `<channel source="tincan" ...>` event format
-serve pushes, so agent instructions are portable across harnesses.
+There are two ways to run a non-claude sink:
+
+- **`tincan serve` + `CHANNEL_SINK`** — when the harness can mount MCP
+  servers (OpenCode can). One process then does both directions: the
+  harness gets the `send_message` / `list_peers` tools over stdio, and the
+  drain loop injects inbound messages over HTTP.
+- **`tincan pump {opencode|hermes}`** — the standalone delivery head, for
+  deployments where nothing holds serve's stdin (a hermes gateway; an
+  opencode server you don't want tincan tools in). Same drain loop, run as
+  a plain foreground process (e.g. a systemd user unit); flags are sugar
+  over the same envs.
 
 **OpenCode** — targets a live [`opencode serve`](https://opencode.ai/docs/server/)
-(default `http://127.0.0.1:4096`); the whole claim batch becomes one user
-turn via `POST /session/{id}/prompt_async`:
+(`OPENCODE_URL`, default `http://127.0.0.1:4096`); each message becomes a
+user turn via `POST /session/{id}/prompt_async`. The target session is
+resolved by title (`OPENCODE_SESSION_TITLE`) — found or created on first
+delivery, re-resolved if it vanishes — so restarts re-enter the same
+conversation with no local state; pin an exact one with
+`OPENCODE_SESSION_ID`, scope title matching with `OPENCODE_DIRECTORY`. Basic
+auth follows opencode's own `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`.
 
-```bash
-TINCAN_MAILBOX=clem tincan pump opencode                    # auto-creates a session
-tincan pump opencode --mailbox clem --session ses_abc123    # or target one
-tincan pump opencode --url http://127.0.0.1:4096            # non-default server
+```jsonc
+// opencode.json — one process: tools + injection
+{
+  "mcp": {
+    "tincan": {
+      "type": "local",
+      "command": ["tincan", "serve"],
+      "environment": { "TINCAN_MAILBOX": "clem", "CHANNEL_SINK": "opencode" }
+    }
+  }
+}
 ```
 
-Without `--session`, pump creates a session titled `tincan: <mailbox>` once
-and persists its ID in `<mailbox>/opencode-session.json` — restarts re-enter
-the same conversation, and a 404 (opencode storage reset) forgets it and
-re-creates next cycle. Basic auth follows opencode's own envs
-(`OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`). For the *outbound*
-direction, register `tincan serve` as an MCP server in `opencode.json` — the
-`send_message` / `list_peers` tools work as-is (opencode ignores the channel
-notifications serve emits; pump is the inbound path).
+```bash
+# or standalone (defaults the title to "tincan: <mailbox>")
+TINCAN_MAILBOX=clem tincan pump opencode
+tincan pump opencode --mailbox clem --title "clem main"     # resolve by title
+tincan pump opencode --mailbox clem --session ses_abc123    # or pin an ID
+```
 
 **Hermes** — targets a [hermes gateway webhook route](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks)
-(`POST :8644/webhooks/<route>`), one POST per message, signed with the
-route's Generic V2 secret (`HMAC-SHA256` of `<timestamp>.<body>`):
+(`HERMES_WEBHOOK_URL`, e.g. `http://127.0.0.1:8644/webhooks/tincan`), one
+POST per message, signed with the route's Generic V2 secret
+(`HERMES_WEBHOOK_SECRET`; HMAC-SHA256 of `<timestamp>.<body>`) and
+deduplicated by an `X-Request-ID` of `tincan-<event_id>` — hermes drops
+repeats for 1h, which pairs with the spool's at-least-once redelivery.
+Each event spawns a run; hermes has no persistent session to inject into.
 
 ```bash
-TINCAN_HERMES_SECRET=... tincan pump hermes \
+HERMES_WEBHOOK_SECRET=... tincan pump hermes \
   --url http://127.0.0.1:8644/webhooks/tincan --mailbox jessica
 ```
 
-The payload is the `Msg` JSON, so the route template addresses fields
-directly. Gateway side (`config.yaml`):
+The payload is `{"body": "<channel ...>...</channel>", "meta": {...}}`, so
+the gateway route is just:
 
 ```yaml
 platforms:
@@ -198,10 +223,7 @@ platforms:
       routes:
         tincan:
           secret: "..."          # or INSECURE_NO_AUTH on loopback
-          prompt: |
-            <channel source="tincan" kind="message" from="{from}" event_id="{id}" queued_at="{queued_at}" reply_to="{reply_to}">
-            {body}
-            </channel>
+          prompt: "{body}"
 ```
 
 Outbound from hermes is the CLI: have the agent run

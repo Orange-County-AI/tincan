@@ -1,225 +1,109 @@
 package main
 
+// Pump tests: flag -> sink wiring, and drainOnce's ordered ack-the-delivered-
+// prefix contract (the piece pump shares with serve). Sink internals are
+// covered in sink_test.go.
+
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"os"
+	"errors"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
 
-// pumpOnce mirrors one runPump cycle: claim, deliver, ack the delivered prefix.
-func pumpOnce(t *testing.T, box string, sink pumpSink) (delivered int, deliverErr error) {
-	t.Helper()
-	claims, err := claimPending(box)
-	if err != nil {
-		t.Fatalf("claimPending: %v", err)
-	}
-	msgs := make([]Msg, len(claims))
-	for i, c := range claims {
-		msgs[i] = c.msg
-	}
-	n, err := sink.deliver(msgs)
-	for i := 0; i < n && i < len(claims); i++ {
-		claims[i].ack()
-	}
-	return n, err
+// fakeSink records deliveries and fails on the Nth call.
+type fakeSink struct {
+	delivered []string // event_ids in delivery order
+	failAt    int      // 1-based call number to fail on; 0 = never
 }
 
-func queueFiles(t *testing.T, box string) []string {
-	t.Helper()
-	files, err := filepath.Glob(filepath.Join(queueDir(box), "*.json"))
-	if err != nil {
-		t.Fatal(err)
+func (f *fakeSink) deliver(content string, meta map[string]string) error {
+	if f.failAt > 0 && len(f.delivered)+1 == f.failAt {
+		return errors.New("sink down")
 	}
-	return files
+	f.delivered = append(f.delivered, meta["event_id"])
+	return nil
 }
 
-func TestOpencodeSinkBatchesIntoOneTurn(t *testing.T) {
+func TestDrainOnceAcksDeliveredPrefixOnly(t *testing.T) {
 	t.Setenv("TINCAN_DATA_DIR", t.TempDir())
-	var gotPath, gotText string
-	var posts int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		posts++
-		gotPath = r.URL.Path
-		var body struct {
-			Parts []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"parts"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Parts) != 1 {
-			t.Errorf("bad prompt body: %v (parts=%d)", err, len(body.Parts))
-		} else {
-			gotText = body.Parts[0].Text
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
 	q := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	for _, m := range []*Msg{
-		{ID: "aaa111", From: "fifty", To: "clem", Body: "first", QueuedAt: q},
-		{ID: "bbb222", From: "stub@citadel", To: "clem", Body: "second", ReplyTo: "aaa111", QueuedAt: q.Add(time.Second)},
-	} {
-		if err := enqueueMsg(m); err != nil {
+	for i, id := range []string{"aaa111", "bbb222", "ccc333"} {
+		msg := &Msg{ID: id, From: "fifty", To: "jessica", Body: "m" + id, QueuedAt: q.Add(time.Duration(i) * time.Second)}
+		if err := enqueueMsg(msg); err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	sink := &opencodeSink{base: srv.URL, session: "ses_test", box: "clem"}
-	n, err := pumpOnce(t, "clem", sink)
-	if err != nil || n != 2 {
-		t.Fatalf("deliver = (%d, %v), want (2, nil)", n, err)
+	f := &fakeSink{failAt: 2} // second message fails -> break, keep order
+	drainOnce("jessica", f)
+	if len(f.delivered) != 1 || f.delivered[0] != "aaa111" {
+		t.Fatalf("delivered = %v, want [aaa111]", f.delivered)
 	}
-	if posts != 1 {
-		t.Fatalf("want the whole backlog batched into 1 POST, got %d", posts)
+	// First acked; the failed message and everything behind it retained.
+	files, _ := filepath.Glob(filepath.Join(queueDir("jessica"), "*.json"))
+	if len(files) != 2 {
+		t.Fatalf("want 2 retained messages, got %v", files)
 	}
-	if gotPath != "/session/ses_test/prompt_async" {
-		t.Errorf("posted to %q", gotPath)
+	// Next cycle re-claims the tail in queue order.
+	f2 := &fakeSink{}
+	drainOnce("jessica", f2)
+	if len(f2.delivered) != 2 || f2.delivered[0] != "bbb222" || f2.delivered[1] != "ccc333" {
+		t.Fatalf("retry delivered = %v, want [bbb222 ccc333]", f2.delivered)
 	}
-	// Same event format serve pushes, ordered by queue time, one blank line apart.
-	wantFirst := "<channel source=\"tincan\" kind=\"message\" from=\"fifty\" event_id=\"aaa111\" queued_at=\"2026-07-19T12:00:00Z\">\nfirst\n</channel>"
-	if !strings.HasPrefix(gotText, wantFirst) {
-		t.Errorf("first block:\n%s\nwant prefix:\n%s", gotText, wantFirst)
-	}
-	if !strings.Contains(gotText, `reply_to="aaa111"`) || strings.Index(gotText, "aaa111") > strings.Index(gotText, "bbb222") {
-		t.Errorf("second block missing reply_to or out of order:\n%s", gotText)
-	}
-	if files := queueFiles(t, "clem"); len(files) != 0 {
-		t.Errorf("queue not empty after ack: %v", files)
+	if files, _ := filepath.Glob(filepath.Join(queueDir("jessica"), "*.json")); len(files) != 0 {
+		t.Fatalf("queue not empty after retry: %v", files)
 	}
 }
 
-func TestOpencodeSinkAutoCreatesAndPersistsSession(t *testing.T) {
+func TestPumpSetupOpencodeDefaultsTitleToMailbox(t *testing.T) {
 	t.Setenv("TINCAN_DATA_DIR", t.TempDir())
-	var created, prompted int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == "POST" && r.URL.Path == "/session":
-			created++
-			user, pass, ok := r.BasicAuth()
-			if !ok || user != "opencode" || pass != "hunter2" {
-				t.Errorf("basic auth = (%q, %q, %v)", user, pass, ok)
-			}
-			json.NewEncoder(w).Encode(map[string]string{"id": "ses_new"})
-		case strings.HasSuffix(r.URL.Path, "/prompt_async"):
-			prompted++
-			if r.URL.Path != "/session/ses_new/prompt_async" {
-				t.Errorf("prompted %q", r.URL.Path)
-			}
-			w.WriteHeader(http.StatusOK)
-		default:
-			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	defer srv.Close()
-
-	if err := enqueueMsg(&Msg{ID: "ccc333", From: "cli", To: "clem", Body: "hi"}); err != nil {
+	t.Setenv("CHANNEL_SINK", "")
+	t.Setenv("OPENCODE_SESSION_TITLE", "")
+	box, dlv, err := pumpSetup([]string{"opencode", "--mailbox", "clem"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	sink := &opencodeSink{base: srv.URL, box: "clem", username: "opencode", password: "hunter2"}
-	if n, err := pumpOnce(t, "clem", sink); err != nil || n != 1 {
-		t.Fatalf("deliver = (%d, %v)", n, err)
+	if box != "clem" {
+		t.Fatalf("box = %q", box)
 	}
-	if created != 1 || prompted != 1 {
-		t.Fatalf("created=%d prompted=%d", created, prompted)
+	oc, ok := dlv.(*opencodeSink)
+	if !ok {
+		t.Fatalf("sink is %T, want *opencodeSink", dlv)
 	}
-	// The session ID is persisted next to the mailbox and reused on restart.
-	fresh := &opencodeSink{base: srv.URL, box: "clem", username: "opencode", password: "hunter2"}
-	if err := enqueueMsg(&Msg{ID: "ddd444", From: "cli", To: "clem", Body: "again"}); err != nil {
-		t.Fatal(err)
+	if oc.title != "tincan: clem" {
+		t.Fatalf("title = %q, want \"tincan: clem\"", oc.title)
 	}
-	if n, err := pumpOnce(t, "clem", fresh); err != nil || n != 1 {
-		t.Fatalf("second deliver = (%d, %v)", n, err)
-	}
-	if created != 1 {
-		t.Errorf("session re-created on restart: created=%d", created)
+	if oc.base != "http://127.0.0.1:4096" {
+		t.Fatalf("base = %q", oc.base)
 	}
 }
 
-func TestOpencodeSinkForgetsGoneManagedSession(t *testing.T) {
+func TestPumpSetupHermesRequiresURL(t *testing.T) {
 	t.Setenv("TINCAN_DATA_DIR", t.TempDir())
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer srv.Close()
-	if err := ensureBox("clem"); err != nil {
+	t.Setenv("HERMES_WEBHOOK_URL", "")
+	if _, _, err := pumpSetup([]string{"hermes", "--mailbox", "clem"}); err == nil {
+		t.Fatal("expected error without a webhook URL")
+	}
+	box, dlv, err := pumpSetup([]string{"hermes", "--mailbox", "clem", "--url", "http://127.0.0.1:8644/webhooks/tincan", "--secret", "s3cret"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	sink := &opencodeSink{base: srv.URL, box: "clem"}
-	if err := writeJSON(sink.sessionFile(), map[string]string{"id": "ses_stale"}); err != nil {
-		t.Fatal(err)
+	h, ok := dlv.(*hermesSink)
+	if !ok || box != "clem" {
+		t.Fatalf("got (%q, %T)", box, dlv)
 	}
-	if err := enqueueMsg(&Msg{ID: "eee555", From: "cli", To: "clem", Body: "hi"}); err != nil {
-		t.Fatal(err)
-	}
-	n, err := pumpOnce(t, "clem", sink)
-	if n != 0 || err == nil {
-		t.Fatalf("deliver = (%d, %v), want (0, error)", n, err)
-	}
-	if _, statErr := os.Stat(sink.sessionFile()); !os.IsNotExist(statErr) {
-		t.Errorf("stale session file not removed")
-	}
-	// Message stayed claimed: still present, re-claimed by the next cycle.
-	if files := queueFiles(t, "clem"); len(files) != 1 {
-		t.Errorf("want 1 retained message, got %v", files)
+	if h.url != "http://127.0.0.1:8644/webhooks/tincan" || h.secret != "s3cret" {
+		t.Fatalf("sink = %+v", h)
 	}
 }
 
-func TestHermesSinkSignsAndStopsAtFirstFailure(t *testing.T) {
+func TestPumpSetupRejectsUnknownKindAndMissingMailbox(t *testing.T) {
 	t.Setenv("TINCAN_DATA_DIR", t.TempDir())
-	const secret = "route-secret"
-	var posts int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		posts++
-		body, _ := io.ReadAll(r.Body)
-		ts := r.Header.Get("X-Webhook-Timestamp")
-		mac := hmac.New(sha256.New, []byte(secret))
-		mac.Write([]byte(ts + "."))
-		mac.Write(body)
-		if want := hex.EncodeToString(mac.Sum(nil)); r.Header.Get("X-Webhook-Signature-V2") != want {
-			t.Errorf("bad signature for body %s", body)
-		}
-		var m Msg
-		if err := json.Unmarshal(body, &m); err != nil || m.From == "" || m.Body == "" {
-			t.Errorf("payload is not a Msg: %s", body)
-		}
-		if posts == 2 {
-			w.WriteHeader(http.StatusBadGateway) // second message fails
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	q := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	for _, m := range []*Msg{
-		{ID: "fff666", From: "fifty", To: "jessica", Body: "one", QueuedAt: q},
-		{ID: "ggg777", From: "fifty", To: "jessica", Body: "two", QueuedAt: q.Add(time.Second)},
-	} {
-		if err := enqueueMsg(m); err != nil {
-			t.Fatal(err)
-		}
+	t.Setenv("TINCAN_MAILBOX", "")
+	if _, _, err := pumpSetup([]string{"codex", "--mailbox", "clem"}); err == nil {
+		t.Fatal("expected error for unknown sink kind")
 	}
-	sink := &hermesSink{url: srv.URL + "/webhooks/tincan", secret: secret}
-	n, err := pumpOnce(t, "jessica", sink)
-	if n != 1 || err == nil {
-		t.Fatalf("deliver = (%d, %v), want (1, error)", n, err)
-	}
-	// First acked, second retained for the next cycle.
-	if files := queueFiles(t, "jessica"); len(files) != 1 {
-		t.Errorf("want 1 retained message, got %v", files)
-	}
-	claims, err := claimPending("jessica")
-	if err != nil || len(claims) != 1 || claims[0].msg.ID != "ggg777" {
-		t.Fatalf("re-claim = (%v, %v), want the failed message back", claims, err)
+	if _, _, err := pumpSetup([]string{"opencode"}); err == nil {
+		t.Fatal("expected error without a mailbox")
 	}
 }

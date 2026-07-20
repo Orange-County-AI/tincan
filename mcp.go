@@ -83,7 +83,11 @@ func serve() error {
 		return err
 	}
 	out := &stdoutWriter{enc: json.NewEncoder(os.Stdout)}
-	startPolling := sync.OnceFunc(func() { go drainLoop(out) })
+	dlv, err := newSink("tincan", out)
+	if err != nil {
+		return err
+	}
+	startPolling := sync.OnceFunc(func() { go drainLoop(mailboxName(), dlv) })
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -115,6 +119,7 @@ func serve() error {
 				"serverInfo":   map[string]any{"name": "tincan", "version": version},
 				"instructions": serverInstructions(),
 			})
+			startPolling() // don't rely on the client sending notifications/initialized
 		case "notifications/initialized":
 			startPolling()
 		case "ping":
@@ -132,40 +137,47 @@ func serve() error {
 	return scanner.Err()
 }
 
-// drainLoop polls this session's mailbox and pushes each claimed message into
-// the session. Delivery order: claim -> notify -> ack, so a crash
-// mid-delivery redelivers (at-least-once); the message ID doubles as an
-// idempotency key. Each cycle also refreshes the presence heartbeat that
-// makes this mailbox show as listening in list_peers.
-func drainLoop(out *stdoutWriter) {
-	box := mailboxName()
+// drainLoop polls this session's mailbox and delivers each claimed message
+// into the session via the configured sink (CHANNEL_SINK). Delivery order:
+// claim -> deliver -> ack; an unacked (claimed) message is re-claimed on the
+// next poll, so a crash or a failing sink redelivers (at-least-once) and the
+// message ID doubles as an idempotency key. Each cycle also refreshes the
+// presence heartbeat that makes this mailbox show as listening in list_peers.
+func drainLoop(box string, dlv sink) {
 	since := time.Now().UTC()
 	ticker := time.NewTicker(pollInterval())
 	defer ticker.Stop()
 	for {
 		markPresence(box, since)
 		go sweepAllOutboxes() // opportunistic cross-host retry; self rate-limited
-		msgs, err := claimPending(box)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "tincan: drain: %v\n", err)
-		}
-		for _, c := range msgs {
-			meta := map[string]string{
-				"kind":      "message",
-				"from":      c.msg.From,
-				"event_id":  c.msg.ID,
-				"queued_at": c.msg.QueuedAt.Format(time.RFC3339),
-			}
-			if c.msg.ReplyTo != "" {
-				meta["reply_to"] = c.msg.ReplyTo
-			}
-			out.notify("notifications/claude/channel", map[string]any{
-				"content": c.msg.Body,
-				"meta":    meta,
-			})
-			c.ack()
-		}
+		drainOnce(box, dlv)
 		<-ticker.C
+	}
+}
+
+// drainOnce runs one claim -> deliver -> ack cycle.
+func drainOnce(box string, dlv sink) {
+	msgs, err := claimPending(box)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tincan: drain: %v\n", err)
+	}
+	for _, c := range msgs {
+		meta := map[string]string{
+			"kind":      "message",
+			"from":      c.msg.From,
+			"event_id":  c.msg.ID,
+			"queued_at": c.msg.QueuedAt.Format(time.RFC3339),
+		}
+		if c.msg.ReplyTo != "" {
+			meta["reply_to"] = c.msg.ReplyTo
+		}
+		if err := dlv.deliver(c.msg.Body, meta); err != nil {
+			// Leave claimed: retried next poll. Break to preserve order
+			// and avoid hammering a down sink with the rest of the batch.
+			fmt.Fprintf(os.Stderr, "tincan: deliver %s failed (retrying next poll): %v\n", c.msg.ID, err)
+			break
+		}
+		c.ack()
 	}
 }
 
