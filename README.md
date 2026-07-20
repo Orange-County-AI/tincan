@@ -146,6 +146,67 @@ That's the entire deployment: the remote side is just the `deliver` and
   original is still queued, but consumers should treat `event_id` as the
   idempotency key.
 
+## Other harnesses (`tincan pump`)
+
+Everything above the last hop — mailbox spool, claim → ack, ssh cross-host,
+outbox retry — is harness-agnostic; only `serve`'s MCP-channel push is
+Claude-Code-specific. `tincan pump` is the alternative delivery head: it
+drains a mailbox exactly like serve (same at-least-once contract, same
+presence heartbeat, so the mailbox shows as `listening` in `list_peers`) but
+injects each backlog into another harness's live session over HTTP. Senders
+never know or care what harness a mailbox fronts.
+
+Messages arrive in the same `<channel source="tincan" ...>` event format
+serve pushes, so agent instructions are portable across harnesses.
+
+**OpenCode** — targets a live [`opencode serve`](https://opencode.ai/docs/server/)
+(default `http://127.0.0.1:4096`); the whole claim batch becomes one user
+turn via `POST /session/{id}/prompt_async`:
+
+```bash
+TINCAN_MAILBOX=clem tincan pump opencode                    # auto-creates a session
+tincan pump opencode --mailbox clem --session ses_abc123    # or target one
+tincan pump opencode --url http://127.0.0.1:4096            # non-default server
+```
+
+Without `--session`, pump creates a session titled `tincan: <mailbox>` once
+and persists its ID in `<mailbox>/opencode-session.json` — restarts re-enter
+the same conversation, and a 404 (opencode storage reset) forgets it and
+re-creates next cycle. Basic auth follows opencode's own envs
+(`OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`). For the *outbound*
+direction, register `tincan serve` as an MCP server in `opencode.json` — the
+`send_message` / `list_peers` tools work as-is (opencode ignores the channel
+notifications serve emits; pump is the inbound path).
+
+**Hermes** — targets a [hermes gateway webhook route](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks)
+(`POST :8644/webhooks/<route>`), one POST per message, signed with the
+route's Generic V2 secret (`HMAC-SHA256` of `<timestamp>.<body>`):
+
+```bash
+TINCAN_HERMES_SECRET=... tincan pump hermes \
+  --url http://127.0.0.1:8644/webhooks/tincan --mailbox jessica
+```
+
+The payload is the `Msg` JSON, so the route template addresses fields
+directly. Gateway side (`config.yaml`):
+
+```yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      routes:
+        tincan:
+          secret: "..."          # or INSECURE_NO_AUTH on loopback
+          prompt: |
+            <channel source="tincan" kind="message" from="{from}" event_id="{id}" queued_at="{queued_at}" reply_to="{reply_to}">
+            {body}
+            </channel>
+```
+
+Outbound from hermes is the CLI: have the agent run
+`tincan send <to> "<msg>" --from <mailbox>` (a shell-tool one-liner).
+
 ## Notes & semantics
 
 - **Durable, uncoalesced, ordered by queue time.** Every message is its own
