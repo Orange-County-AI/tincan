@@ -1,0 +1,14 @@
+# Enable and start with: systemctl --user enable --now tincan
+# herdr must be reachable at its configured or resolved Unix-socket path.
+[Unit]
+Description=tincan — agent-to-agent messaging daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/tincan daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

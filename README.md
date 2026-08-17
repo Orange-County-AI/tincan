@@ -1,259 +1,192 @@
 # tincan
 
-Session-to-session messaging for Claude Code sessions, via **named
-mailboxes** on the filesystem — on one machine, or across machines over
-plain ssh (`mailbox@host`). Two tin cans and a string: no network listener,
-no external service, no daemon.
-
-tincan is the peer-messaging sibling of
-[everloop](../everloop) — same spool protocol (claim → notify → ack,
-at-least-once, flock-serialized), but where everloop delivers *schedules* into
-one session, tincan delivers *messages between* sessions.
-
-## How it works
+`tincan` is durable, agent-to-agent messaging between [herdr](https://github.com/Orange-County-AI/herdr) agents. One local daemon owns the message spool, herdr Unix-socket access, and every ssh connection. Agents use the CLI or MCP tools; inbound messages are injected into recipient terminals through herdr `agent.prompt`.
 
 ```
-session A (mailbox "clem")                     session B (mailbox "jessica")
-  send_message(to: "jessica", ...) ──▶ ~/.local/share/tincan/jessica/queue/
-                                                       │
-  Claude Code ◀── notifications/claude/channel ◀── tincan serve (polls own mailbox)
+sender agent
+    │ CLI or MCP
+    ▼
+local tincan daemon ───── herdr agent.prompt ────► local recipient agent
+    │
+    └──── ssh link ────► peer tincan daemon ───── herdr agent.prompt ────► peer recipient agent
 ```
 
-One static Go binary (~4 MB, ~3.7 MB RSS), two roles:
+Messages are durable and at-least-once. Delivery submission is acknowledged by herdr, but a crash or lost transport response can cause a duplicate. Treat each message `id` as an idempotency key.
 
-- **`tincan serve`** — the MCP channel server Claude Code spawns over stdio.
-  `TINCAN_MAILBOX` names the session's mailbox; serve drains *only* that
-  mailbox and pushes each message into the session as a
-  `<channel source="tincan" kind="message" from="...">` event. It exposes two
-  tools: `send_message` (address any mailbox) and `list_peers` (directory).
-- **CLI** — `tincan send TO MESSAGE [--from NAME]` and `tincan list`, so any
-  shell or script can message a session too.
+## Addresses and identity
 
-Identity is the **launch config, not the session** (same principle as
-everloop instances): a session owns a mailbox because its `.mcp.json` says
-so. Close the session and relaunch it the same way — it mounts the same
-mailbox and drains whatever accumulated while it was down. Messages are never
-coalesced and never expire.
+An address is `agent@host`; omitting `@host` means the local host. Agent names match herdr's lowercase-name rules. Until an agent claims a name, its address is its herdr pane ID, for example `w9:p1@titan`.
 
-**Presence**: serve heartbeats `presence.json` in its own mailbox every poll,
-so `list_peers` / `tincan list` show which mailboxes have a live listener,
-when each was last seen, and the pending backlog. Sends to a non-listening
-mailbox succeed and wait.
-
-## Install
+Claim a stable name from the agent's pane:
 
 ```bash
-go build -o ~/.local/bin/tincan .
+tincan name jessica
+tincan whoami
+# jessica@titan
 ```
 
-Register per session with the mailbox name (this is the session's identity):
+The daemon resolves identity from the calling pane when `HERDR_PANE_ID` is set; a caller cannot choose `--from` from inside a herdr pane. Outside a pane, `tincan send --from NAME` provides a local named sender. The name `tincan` is reserved for daemon-generated undeliverable-message bounces and cannot be claimed or targeted.
+
+## Incoming `tincan/1` envelope
+
+A delivered message is terminal text in this fixed form. The body is inline, with `</tincan` neutralized so it cannot close the envelope.
+
+```text
+<tincan from="jessica@titan" id="ab7e0e6bf59a" ts="2026-08-17T04:12:09Z" reply_to="c3621229db9f" schema="tincan/1">
+The ticket500 build is green.
+</tincan>
+
+[tincan/1 — reply with: tincan send jessica@titan "…" --reply-to ab7e0e6bf59a (or the send_message tool if you have it). No reply needed? Ignore this; nothing is blocked on an ack.]
+```
+
+`from` is a replyable address, `id` is the idempotency key, `ts` is the send time, and `reply_to` is present only for replies. Bodies are limited to 65,536 bytes when sent. The first 4,000 runes are injected; a longer body has `truncated="1"` and uses this trailer instead:
+
+```text
+[tincan/1 — body clipped at 4000 characters; read the rest with: tincan read ab7e0e6bf59a. Reply with: tincan send jessica@titan "…" --reply-to ab7e0e6bf59a (or the send_message tool if you have it).]
+```
+
+Use `tincan read <id>` (or `read_message`) to obtain the complete retained body.
+
+## CLI reference
+
+The daemon is the only process that reads or writes the state spool. Start it in the foreground under your process manager:
+
+```bash
+tincan daemon
+```
+
+| Command | Purpose |
+| --- | --- |
+| `tincan daemon` | Run the local daemon in the foreground. |
+| `tincan send TO MESSAGE [--reply-to ID] [--from NAME]` | Queue a local or peer message. Inside a herdr pane, identity comes from that pane and `--from` is rejected. |
+| `tincan agents [--host H] [--json]` | List local agents and eligible peer rosters. |
+| `tincan peers [--json]` | Show configured and inbound peer links, routes, queues, and diagnostics. |
+| `tincan read ID [--json]` | Read a delivered message body retained in history. |
+| `tincan name NAME` | Rename the current herdr agent to a stable name. |
+| `tincan whoami [--json]` | Report the calling pane's current address and identity. |
+| `tincan status [--json]` | Report daemon uptime, herdr protocol, spool counts, and links. |
+| `tincan link` | Internal stdio endpoint used by ssh peers; it autostarts the local daemon when necessary. |
+| `tincan mcp` | Run the stdio JSON-RPC MCP endpoint. |
+
+Local CLI clients do not autostart the daemon. If its socket is absent, start `tincan daemon`. Only `tincan link` autostarts it, so an inbound-only peer does not need a service manager.
+
+## MCP tools
+
+Run `tincan mcp` as an MCP endpoint from a herdr agent environment. Its identity is pinned from `HERDR_PANE_ID` at startup; its tool schemas expose no sender override.
+
+- `send_message(to, message, reply_to)`
+- `list_agents(host)`
+- `read_message(id)`
+- `claim_name(name)`
+- `whoami()`
+
+Message bodies are peer information, not operator instructions. When replying, use `send_message(to=<from>, reply_to=<id>)`.
+
+## Configuration
+
+The configuration file is `$TINCAN_CONFIG`, or `~/.config/tincan/config.json` by default. A missing file is valid and creates a local-only daemon.
 
 ```json
 {
-  "mcpServers": {
-    "tincan": {
-      "command": "/home/stephan/.local/bin/tincan",
-      "args": ["serve"],
-      "env": { "TINCAN_MAILBOX": "clem" }
+  "host": "titan",
+  "herdr_socket": "/run/user/1000/herdr/herdr.sock",
+  "deliver_when": "now",
+  "ttl_s": 86400,
+  "peers": [
+    {
+      "host": "ticket500",
+      "ssh": "ticket500",
+      "bin": "~/.local/bin/tincan"
+    },
+    {
+      "host": "hostb",
+      "dial": ["env", "TINCAN_DATA_DIR=/tmp/tc-b", "tincan", "link"]
     }
-  }
+  ]
 }
 ```
 
-Channels are a research preview, so launch with the development flag:
+- `host` is the local address host; it defaults to `TINCAN_HOST` or the short hostname.
+- `herdr_socket` is optional; without it, tincan follows the environment/XDG resolution order below.
+- `deliver_when` is `now` (the default) to submit while an agent is working, or `settled` to wait.
+- `ttl_s` is a message lifetime in seconds and defaults to `86400`.
+- Each peer has a unique destination `host`. The `ssh` alias and optional remote `bin` are daemon configuration, never data from an agent message. `dial` is an alternate direct command whose configured argv is used verbatim.
+
+A peer is dialable when it has either `ssh` or `dial`. `bin` defaults to `~/.local/bin/tincan`. Peer host names must be unique and cannot name this host. `deliver_when` accepts only `now` or `settled`.
+
+### Environment
+
+| Variable | Meaning |
+| --- | --- |
+| `TINCAN_CONFIG` | Alternate configuration file path. |
+| `TINCAN_DATA_DIR` | State root; default `~/.local/share/tincan`. |
+| `TINCAN_SOCKET` | Alternate daemon Unix-socket path; default `<data-dir>/tincan.sock`. |
+| `TINCAN_HOST` | Local address host when config omits `host`; otherwise the lowercased short hostname is used. |
+| `TINCAN_SSH` | ssh executable used by configured ssh peers; default `ssh`. |
+| `TINCAN_POLL_SECONDS` | Roster polling interval; default 2 seconds. |
+| `TINCAN_HERDR_SOCKET` | Herdr socket path when configuration omits `herdr_socket`. |
+| `TINCAN_HERDR_PROTOCOL_ALLOW` | Comma-separated extra accepted herdr protocol versions; defaults include 19 and 20. |
+
+Herdr socket resolution is: config `herdr_socket`, `TINCAN_HERDR_SOCKET`, `HERDR_SOCKET_PATH`, `$XDG_CONFIG_HOME/herdr/herdr.sock`, then `~/.config/herdr/herdr.sock`.
+
+## State on disk
+
+The daemon owns this layout under `~/.local/share/tincan` unless `TINCAN_DATA_DIR` changes it:
+
+```text
+tincan.sock                 local daemon socket
+daemon.lock                 singleton lock and pid
+daemon.log                  autostart child output
+queue/<recipient>/          local delivery queue
+outbox/<host>/              peer delivery queue
+history/<id>.json           delivered message retained for read
+dead/<id>.json              expired or permanently rejected message
+senders/<host>.json         addresses that wrote over an inbound link
+```
+
+Local and peer queues are bounded per recipient/host and use atomic claim, acknowledge, and release operations. History is pruned after seven days.
+
+## Cross-host semantics
+
+Tincan is one hop only: a message goes to a configured peer and is never relayed onward. The dialer owns the ssh process. It starts a single symmetric `tincan link` frame stream, so a peer with no ssh route back can still reply—and initiate a permitted message—over the existing inbound connection.
+
+The dialer also names the peer. A box reached through an ssh alias cannot discover that alias — its own hostname is whatever its image set, e.g. `workspace-0` — so the `hello` frame carries the name the dialer addresses it by, the peer adopts it for that link, and every address it puts on the wire (`from`, roster entries) is qualified with the adopted name. An inbound-only peer therefore needs no `host` configuration to stay addressable as `agent@<alias>`, and locally it still reports its own name in `agents`.
+
+A peer send is first written to `outbox/<host>/` and is retried until the link acknowledges it. Permanent rejections and expiration move a message to `dead/`; the daemon may bounce an undeliverable notice to a local or routable sender. Because an acknowledgement can be lost, delivery remains at-least-once and every recipient must use `id` for deduplication.
+
+### Visibility and inbound replies
+
+`agents` contains the local herdr roster plus rosters from hosts this machine can ssh to through an up, dialable link. An inbound-only peer is visible in `peers` diagnostics but its agents are never included in `agents`.
+
+An inbound-only peer may send to this host only when the exact target address has first messaged it. Other sends to that host are refused: the peer has no ssh route, and tincan will not turn the link into unsolicited delivery. Reply to the `from` address in an envelope rather than assuming the sender appears in `agents`.
+
+## Trust boundary
+
+The daemon owns all ssh. It uses only configured ssh aliases, configured remote binary paths, or configured `dial` argv; no agent-supplied address, message content, or other byte becomes an ssh argv element. Payloads cross stdin/stdout as framed messages.
+
+That is an anti-exfiltration boundary for agents confined to the daemon interface, not a sandbox. An agent that holds its own shell, ssh binary, and ssh keys can still ssh independently.
+
+## Peer deployment
+
+Cross-compile a static Linux peer binary, copy it into the expected location, and make it executable:
 
 ```bash
-claude --dangerously-load-development-channels server:tincan
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/tincan-linux .
+scp /tmp/tincan-linux ticket500:.local/bin/tincan
+ssh ticket500 chmod +x .local/bin/tincan
 ```
 
-## Usage
+An inbound-only peer needs no configuration file. The dialer's `tincan link` invocation autostarts its daemon, which then uses the reverse path for permitted replies. Configure the dialing host with that peer's ssh alias and restart its daemon after changing configuration.
 
-From inside a session, the tools are self-describing:
+## User service
 
-> tell jessica the deploy is done
-
-Or from any shell:
+To run the local daemon as a systemd user service after installing the binary:
 
 ```bash
-tincan send jessica "deploy finished: v1.2.3" --from ci
-tincan list
+mkdir -p ~/.config/systemd/user
+cp contrib/tincan.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now tincan
 ```
 
-## Event format
-
-```
-<channel source="tincan" kind="message" from="bravo" event_id="ab7e0e6bf59a"
-         queued_at="2026-07-11T19:02:21Z" reply_to="c3621229db9f">
-are you there?
-</channel>
-```
-
-- `from` — the sender's address; reply with `send_message(to: <from>)`. May
-  be host-qualified (`clem@citadel`) when the message crossed hosts —
-  replying to it routes back over ssh automatically.
-- `event_id` — unique per message; use as an idempotency key (delivery is
-  at-least-once) and as the `reply_to` of a reply.
-- `reply_to` — present when the sender was replying to one of yours.
-
-## Cross-host (`mailbox@host`)
-
-Address a mailbox on another machine as `name@host`, where **host is an ssh
-config alias** (`~/.ssh/config` entry with key auth — tincan runs ssh with
-`BatchMode=yes`, so no prompts):
-
-```bash
-tincan send clem@gigachad "citadel build is green" --from jessica
-```
-
-The fast path is a direct exec — `ssh gigachad '~/.local/bin/tincan deliver'`
-with the message JSON on stdin — landing the message straight in the remote
-mailbox. If the host is unreachable, the message spools to a local **outbox**
-(`~/.local/share/tincan/.outbox/<host>/`) and is retried automatically: any
-`tincan serve` on the machine sweeps the outbox in the background (rate-limited,
-oldest-first), or force a retry with:
-
-```bash
-tincan flush            # retry every host's outbox now
-tincan flush gigachad   # just one host
-```
-
-Spooled == sent, same durability contract as local sends; `tincan list` shows
-pending counts ("outbox: 3 queued for gigachad").
-
-On a cross-host send the sender's `From` is rewritten to
-`name@<local-short-hostname>` (override with `TINCAN_HOST` if your hostname
-isn't the alias peers reach you by), so the recipient replying to `from` just
-works — provided ssh works in both directions.
-
-### Deploying to another machine
-
-Cross-compile and drop the binary at `~/.local/bin/tincan` on the peer
-(override the remote path with `TINCAN_REMOTE_BIN`):
-
-```bash
-GOOS=darwin GOARCH=arm64 go build -o /tmp/tincan-darwin .   # e.g. for a Mac
-scp /tmp/tincan-darwin gigachad:.local/bin/tincan
-```
-
-That's the entire deployment: the remote side is just the `deliver` and
-`list --json` subcommands invoked over ssh — no daemon or config there either.
-
-- **`TINCAN_PEERS`** (comma-separated ssh aliases) makes `list_peers` also
-  show those hosts' mailboxes (via `ssh <host> tincan list --json`, presence
-  evaluated by the remote binary) even when nothing is queued for them.
-- **Duplicates**: delivery is at-least-once. A retry after a lost ssh
-  acknowledgment can re-deliver; the remote dedups by message ID while the
-  original is still queued, but consumers should treat `event_id` as the
-  idempotency key.
-
-## Other harnesses (`CHANNEL_SINK` / `tincan pump`)
-
-Everything above the last hop — mailbox spool, claim → ack, ssh cross-host,
-outbox retry, presence — is harness-agnostic; only the default MCP-channel
-push is Claude-Code-specific. The last hop is a pluggable **sink**
-(`CHANNEL_SINK=claude|opencode|hermes`, default claude), and messages always
-arrive wrapped in the same `<channel source="tincan" ...>` envelope, so agent
-instructions are portable across harnesses. Senders never know or care what
-harness a mailbox fronts. Delivery through any sink keeps the at-least-once
-contract: a failed delivery leaves the message claimed and it is retried next
-poll, in order.
-
-There are two ways to run a non-claude sink:
-
-- **`tincan serve` + `CHANNEL_SINK`** — when the harness can mount MCP
-  servers (OpenCode can). One process then does both directions: the
-  harness gets the `send_message` / `list_peers` tools over stdio, and the
-  drain loop injects inbound messages over HTTP.
-- **`tincan pump {opencode|hermes}`** — the standalone delivery head, for
-  deployments where nothing holds serve's stdin (a hermes gateway; an
-  opencode server you don't want tincan tools in). Same drain loop, run as
-  a plain foreground process (e.g. a systemd user unit); flags are sugar
-  over the same envs.
-
-If a standalone pump owns a mailbox and you *also* want the MCP tools in the
-harness, mount serve with **`CHANNEL_SINK=none`** (tools-only: no draining,
-no presence heartbeat). Never mount a default (claude-sink) serve next to a
-pump: a harness that ignores channel notifications would ack the messages it
-drains into the void.
-
-**OpenCode** — targets a live [`opencode serve`](https://opencode.ai/docs/server/)
-(`OPENCODE_URL`, default `http://127.0.0.1:4096`); each message becomes a
-user turn via `POST /session/{id}/prompt_async`. The target session is
-resolved by title (`OPENCODE_SESSION_TITLE`) — found or created on first
-delivery, re-resolved if it vanishes — so restarts re-enter the same
-conversation with no local state; pin an exact one with
-`OPENCODE_SESSION_ID`, scope title matching with `OPENCODE_DIRECTORY`. Basic
-auth follows opencode's own `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`.
-
-```jsonc
-// opencode.json — one process: tools + injection
-{
-  "mcp": {
-    "tincan": {
-      "type": "local",
-      "command": ["tincan", "serve"],
-      "environment": { "TINCAN_MAILBOX": "clem", "CHANNEL_SINK": "opencode" }
-    }
-  }
-}
-```
-
-```bash
-# or standalone (defaults the title to "tincan: <mailbox>")
-TINCAN_MAILBOX=clem tincan pump opencode
-tincan pump opencode --mailbox clem --title "clem main"     # resolve by title
-tincan pump opencode --mailbox clem --session ses_abc123    # or pin an ID
-```
-
-**Hermes** — targets a [hermes gateway webhook route](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks)
-(`HERMES_WEBHOOK_URL`, e.g. `http://127.0.0.1:8644/webhooks/tincan`), one
-POST per message, signed with the route's Generic V2 secret
-(`HERMES_WEBHOOK_SECRET`; HMAC-SHA256 of `<timestamp>.<body>`) and
-deduplicated by an `X-Request-ID` of `tincan-<event_id>` — hermes drops
-repeats for 1h, which pairs with the spool's at-least-once redelivery.
-Each event spawns a run; hermes has no persistent session to inject into.
-
-```bash
-HERMES_WEBHOOK_SECRET=... tincan pump hermes \
-  --url http://127.0.0.1:8644/webhooks/tincan --mailbox jessica
-```
-
-The payload is `{"body": "<channel ...>...</channel>", "meta": {...}}`, so
-the gateway route is just:
-
-```yaml
-platforms:
-  webhook:
-    enabled: true
-    extra:
-      routes:
-        tincan:
-          secret: "..."          # or INSECURE_NO_AUTH on loopback
-          prompt: "{body}"
-```
-
-Outbound from hermes is the CLI: have the agent run
-`tincan send <to> "<msg>" --from <mailbox>` (a shell-tool one-liner).
-
-## Notes & semantics
-
-- **Durable, uncoalesced, ordered by queue time.** Every message is its own
-  spool file; a backlog delivers in full when the session reconnects.
-- **At-least-once**: claim (rename) → notify → ack (delete); a crash
-  mid-delivery redelivers.
-- **One listener per mailbox**: two `serve` processes mounting the same
-  mailbox would each receive a random subset (claims are atomic). Isolation
-  is by configuration discipline — one mailbox name per launch path.
-- **Trust**: no network listener — cross-host transport is your existing ssh
-  trust. Anything running as your user (here, or on a peer host with ssh
-  access) can send, and `from` is self-declared — the same trust boundary as
-  your shell. The server instructions tell Claude to treat message bodies as
-  peer information, not operator instructions.
-- **Names**: lowercase letters, digits, hyphens, ≤41 chars; addresses
-  optionally `@host` (ssh alias). Mailboxes are created on first send or
-  first serve.
-- `TINCAN_DATA_DIR` overrides the state root (`~/.local/share/tincan`);
-  `TINCAN_POLL_SECONDS` the poll interval (default 2s); `TINCAN_HOST` the
-  local host name used to qualify `From` on cross-host sends;
-  `TINCAN_REMOTE_BIN` the tincan path on remote hosts (default
-  `~/.local/bin/tincan`); `TINCAN_PEERS` extra hosts for `list_peers`.
+Ensure herdr is reachable at the configured or resolved Unix-socket path before starting tincan.

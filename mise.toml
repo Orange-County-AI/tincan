@@ -1,0 +1,18 @@
+[tools]
+go = "1.26.6"
+
+[tasks.test]
+run = "go test -race ./..."
+
+[tasks.vet]
+run = "go vet ./..."
+
+[tasks.build]
+# Atomic install: build to a temp name, rename into place — never hits ETXTBSY
+# from a running tincan, and the rename is atomic for readers. A running
+# daemon keeps the OLD inode: restart it to pick up a rebuild.
+run = """
+go build -o /tmp/tincan.build .
+mv /tmp/tincan.build ~/.local/bin/tincan
+echo "NOTE: a running tincan daemon holds the OLD inode — restart it to pick this up"
+"""

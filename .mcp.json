@@ -2,8 +2,7 @@
   "mcpServers": {
     "tincan": {
       "command": "/home/stephan/.local/bin/tincan",
-      "args": ["serve"],
-      "env": { "TINCAN_MAILBOX": "dev" }
+      "args": ["mcp"]
     }
   }
 }
