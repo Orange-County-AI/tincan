@@ -539,3 +539,40 @@ func (s *Store) KnownSenderCount(host string) int {
 	}
 	return len(list.Addrs)
 }
+
+// ReplyOnlySenders lists every address that has written to this host over a
+// link, grouped by the host the link belongs to. These are exactly the addresses
+// an inbound-only peer is allowed to answer, and the only routing information it
+// has: it cannot enumerate a host it has no ssh route to.
+func (s *Store) ReplyOnlySenders() (map[string][]string, error) {
+	entries, err := os.ReadDir(filepath.Join(s.root, "senders"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string][]string{}, nil
+		}
+		return nil, err
+	}
+	senders := make(map[string][]string, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		host := strings.TrimSuffix(name, ".json")
+		if !hostRe.MatchString(host) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(s.root, "senders", name))
+		if err != nil {
+			return nil, err
+		}
+		var list senderList
+		if err := json.Unmarshal(data, &list); err != nil {
+			return nil, fmt.Errorf("parse sender list %s: %w", name, err)
+		}
+		if len(list.Addrs) > 0 {
+			senders[host] = list.Addrs
+		}
+	}
+	return senders, nil
+}

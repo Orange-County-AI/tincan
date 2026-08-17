@@ -14,15 +14,20 @@ import (
 
 // RosterAgent is the stable, transport-safe view of an agent.
 type RosterAgent struct {
-	Addr   string `json:"addr"`
-	Name   string `json:"name"`
-	PaneID string `json:"pane_id"`
-	Kind   string `json:"kind"`
-	Status string `json:"status"`
-	CWD    string `json:"cwd,omitempty"`
-	Title  string `json:"title,omitempty"`
-	Host   string `json:"host"`
-	Self   bool   `json:"self,omitempty"`
+	Addr string `json:"addr"`
+	// ReachableAs restates Addr with the names live links know this host by, and
+	// LocalOnly marks an Addr no live link can route. A peer must be given a
+	// ReachableAs form; handing out a LocalOnly Addr produces a dead address.
+	ReachableAs []string `json:"reachable_as,omitempty"`
+	LocalOnly   bool     `json:"local_only,omitempty"`
+	Name        string   `json:"name"`
+	PaneID      string   `json:"pane_id"`
+	Kind        string   `json:"kind"`
+	Status      string   `json:"status"`
+	CWD         string   `json:"cwd,omitempty"`
+	Title       string   `json:"title,omitempty"`
+	Host        string   `json:"host"`
+	Self        bool     `json:"self,omitempty"`
 }
 
 func listenIPC(path string) (net.Listener, error) {
@@ -145,7 +150,14 @@ func (d *daemon) serveIPCConn(ctx context.Context, conn net.Conn) {
 func daemonCall(req map[string]any) (map[string]any, error) {
 	conn, err := net.DialTimeout("unix", socketPath(), 30*time.Second)
 	if err != nil {
-		return nil, errors.New("tincan daemon is not running on this host (start it: tincan daemon)")
+		// Name the path that failed. A stale TINCAN_SOCKET pointing at a deleted
+		// directory reports identically to a stopped daemon otherwise, which sends
+		// the reader off to restart a service that was never down.
+		path := socketPath()
+		if override := os.Getenv("TINCAN_SOCKET"); override != "" {
+			return nil, fmt.Errorf("no tincan daemon at %s (TINCAN_SOCKET is set): %v", path, err)
+		}
+		return nil, fmt.Errorf("tincan daemon is not running on this host (start it: tincan daemon; socket %s)", path)
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))

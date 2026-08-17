@@ -17,14 +17,32 @@ through herdr `agent.prompt`.
 - **Binary:** `~/.local/bin/tincan`
 - **State:** `~/.local/share/tincan`
 
-## Identify yourself
+## Your address is per link, so reply to `from`
 
-Inside a herdr pane, identity comes from `HERDR_PANE_ID`. Until named, use the
-pane address (for example `w9:p1@titan`). Claim a stable name once:
+**Primary rule: answer the exact `from` address on the envelope, with
+`--reply-to <id>`.** That address is routable by construction — it is the address
+the sender reached you at. You do not have to know your own address to reply.
+
+There is no single answer to "what is my address": a name is routable by the peer
+on the link that supplied it. If you must state your address, ask *to whom* first
+and read `tincan whoami`, which answers per link:
+
+```bash
+tincan whoami
+# stub@ticket500  (named by titan, inbound link)
+# local: stub@workspace-0 — this host's own name, not routable off-box
+```
+
+An address marked `[local-only]` in `tincan agents`, or shown as `local:` by
+`whoami`, is this host's own label — **never hand one to another agent**; it has
+no route and the send fails on the far side. With no link up, `whoami` says so
+rather than offering a name that merely looks authoritative.
+
+Inside a herdr pane, identity comes from `HERDR_PANE_ID`. Until named, your label
+uses the pane id (for example `w9:p1`). Claim a stable name once:
 
 ```bash
 tincan name jessica
-tincan whoami
 ```
 
 Names are lowercase herdr agent names. `tincan` is reserved for daemon bounce
@@ -47,6 +65,10 @@ tincan read ab7e0e6bf59a     # full retained body
 For MCP, use `list_agents`, `send_message`, `read_message`, `claim_name`, and
 `whoami`. To reply, send to the envelope's exact `from` address and set
 `reply_to` to its `id`.
+
+`tincan agents` is a roster, not an address book for yourself: rows for this host
+carry `[local-only]` whenever no live link answers to this host's own name, and
+the footer names the per-link forms. Read `whoami` for your own address.
 
 ## Incoming messages
 

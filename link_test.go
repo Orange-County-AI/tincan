@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -407,3 +408,34 @@ func waitFor(t *testing.T, predicate func() bool) {
 	}
 	t.Fatal("condition was not met")
 }
+
+// connectInboundNamed establishes an inbound link that names the accepting side,
+// mirroring what a real dialer sends in hello.you.
+func connectInboundNamed(t *testing.T, m *linkManager, remote, adopted string) (net.Conn, <-chan struct{}) {
+	t.Helper()
+	client, server := net.Pipe()
+	done := make(chan struct{})
+	go func() { m.ServeInbound(context.Background(), server); close(done) }()
+	if err := writeFrame(client, MsgFrame{T: "hello", Host: remote, You: adopted, Proto: linkProto}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := newFrameReader(client).next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.T != "hello_ok" || got.Host != adopted {
+		t.Fatalf("hello reply = %#v, want hello_ok as %s", got, adopted)
+	}
+	waitFor(t, func() bool { _, up := m.Route(remote); return up })
+	return client, done
+}
+
+// newNopStream is a link stream that never yields a frame, for tests that only
+// need an installed session's identity.
+func newNopStream() io.ReadWriteCloser { return nopStream{} }
+
+type nopStream struct{}
+
+func (nopStream) Read([]byte) (int, error)    { return 0, io.EOF }
+func (nopStream) Write(p []byte) (int, error) { return len(p), nil }
+func (nopStream) Close() error                { return nil }

@@ -45,10 +45,13 @@ func TestMCPInitializeProtocolVersion(t *testing.T) {
 			instructions := stringValue(t, result, "instructions")
 			for _, fact := range []string{
 				"<tincan … schema=\"tincan/1\">",
-				"replyable address",
+				"send_message(to=<from>, reply_to=<id>)",
+				"routable by construction",
 				"idempotency key",
 				"duplicates are possible",
-				"send_message(to=<from>, reply_to=<id>)",
+				"no single global address",
+				"whoami answers per link",
+				"local-only",
 				"claim one stable name",
 				"pane id",
 				"list_agents shows this host plus hosts this host can ssh to",

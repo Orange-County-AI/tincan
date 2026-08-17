@@ -248,6 +248,41 @@ func (m *linkManager) Route(host string) (direction string, up bool) {
 	}
 }
 
+// WireName is one link's answer to "what is this host called?". There is no
+// global answer: on an outbound link we announced our configured host, and on an
+// inbound link the dialer named us something our hostname need not match.
+type WireName struct {
+	Addr      string `json:"addr"`
+	Peer      string `json:"peer"`
+	Direction string `json:"direction"`
+}
+
+// WireNames reports the name this host answers to on every live link. Callers
+// must present these per link rather than collapsing them into one address: a
+// name adopted from one dialer is routable only by that dialer.
+func (m *linkManager) WireNames() []WireName {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	names := make([]WireName, 0, len(m.links))
+	for host, s := range m.links {
+		if s == nil || s.localName == "" {
+			continue
+		}
+		select {
+		case <-s.done:
+		default:
+			names = append(names, WireName{Addr: s.localName, Peer: host, Direction: s.direction})
+		}
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if names[i].Addr != names[j].Addr {
+			return names[i].Addr < names[j].Addr
+		}
+		return names[i].Peer < names[j].Peer
+	})
+	return names
+}
+
 func (m *linkManager) Peers(ctx context.Context) []PeerStatus {
 	_, outbox, err := m.st.Counts()
 	if err != nil {

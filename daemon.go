@@ -532,9 +532,21 @@ func (d *daemon) handleAgents(ctx context.Context, req map[string]any) map[strin
 	}
 	agents := []RosterAgent{}
 	hosts := []map[string]any{}
+	names := d.wireNames()
+	selfRoutable := localRoutable(names, d.cfg.Host)
 	if host == "" || host == d.cfg.Host {
-		agents = append(agents, d.localRoster()...)
-		hosts = append(hosts, map[string]any{"host": d.cfg.Host, "source": "local", "ok": true})
+		local := d.localRoster()
+		// A local address is routable only if a live link answers to this host's
+		// own name. Otherwise it is a local label, and a reader that hands it to a
+		// peer gets a dead address with no error at the point of the mistake — so
+		// say so on every row and give the per-link forms.
+		for i := range local {
+			local[i].ReachableAs = reachableAs(local[i].Addr, names)
+			local[i].LocalOnly = !selfRoutable
+		}
+		agents = append(agents, local...)
+		hosts = append(hosts, map[string]any{"host": d.cfg.Host, "source": "local", "ok": true,
+			"local_only": !selfRoutable, "wire_names": names})
 	}
 	for _, peer := range d.cfg.Peers {
 		if !peer.Dialable() || (host != "" && peer.Host != host) {
@@ -552,7 +564,100 @@ func (d *daemon) handleAgents(ctx context.Context, req map[string]any) map[strin
 		hosts = append(hosts, map[string]any{"host": peer.Host, "source": "peer", "ok": true})
 		agents = append(agents, remote...)
 	}
-	return success(map[string]any{"agents": agents, "hosts": hosts})
+	// An inbound-only peer cannot enumerate the host that dialed it. The senders
+	// that reached it are its entire routable world, so name them rather than
+	// leaving an agent with an empty roster and no next step.
+	replyOnly := []map[string]any{}
+	if host == "" {
+		senders, err := d.store.ReplyOnlySenders()
+		if err != nil {
+			d.Logf("tincan: list reply-only senders: %v", err)
+		}
+		for _, senderHost := range sortedKeys(senders) {
+			if peer, found := d.cfg.FindPeer(senderHost); found && peer.Dialable() {
+				continue // already enumerable through its own roster
+			}
+			for _, addr := range senders[senderHost] {
+				replyOnly = append(replyOnly, map[string]any{"addr": addr, "host": senderHost, "via": "inbound"})
+			}
+		}
+	}
+	return success(map[string]any{"agents": agents, "hosts": hosts, "reply_only": replyOnly,
+		"wire_names": names, "local_host": d.cfg.Host, "local_routable": selfRoutable})
+}
+
+// wireNames lists the per-link names this host answers to. It is deliberately a
+// list and not a single value: an address is routable by the peer on that link
+// and by nobody else.
+func (d *daemon) wireNames() []WireName {
+	if d.links == nil {
+		return []WireName{}
+	}
+	return d.links.WireNames()
+}
+
+// localRoutable reports whether this host's own name is one a live link can route.
+// A dialer announces its configured host, so there it is true; a box that only
+// ever accepts links is known by the alias its dialer chose, so there it is false.
+func localRoutable(names []WireName, host string) bool {
+	for _, name := range names {
+		if name.Addr == host {
+			return true
+		}
+	}
+	return false
+}
+
+// agentAddresses restates one agent's address for every live link.
+func agentAddresses(addr string, names []WireName) []map[string]any {
+	agent, _, err := parseAddr(addr)
+	if err != nil || len(names) == 0 {
+		return []map[string]any{}
+	}
+	out := make([]map[string]any, 0, len(names))
+	for _, name := range names {
+		out = append(out, map[string]any{
+			"addr":      joinAddr(agent, name.Addr),
+			"peer":      name.Peer,
+			"direction": name.Direction,
+			"how":       wireNameOrigin(name),
+		})
+	}
+	return out
+}
+
+func wireNameOrigin(name WireName) string {
+	if name.Direction == "inbound" {
+		return "named by " + name.Peer
+	}
+	return "announced to " + name.Peer
+}
+
+func reachableAs(addr string, names []WireName) []string {
+	agent, _, err := parseAddr(addr)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := []string{}
+	for _, name := range names {
+		form := joinAddr(agent, name.Addr)
+		if _, dup := seen[form]; dup {
+			continue
+		}
+		seen[form] = struct{}{}
+		out = append(out, form)
+	}
+	return out
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (d *daemon) handleRead(req map[string]any) map[string]any {
@@ -594,7 +699,26 @@ func (d *daemon) handleWhoami(ctx context.Context, req map[string]any) map[strin
 	if identity == "" {
 		identity = agent.PaneID
 	}
-	return success(map[string]any{"addr": joinAddr(identity, d.cfg.Host), "name": agent.Name, "pane_id": agent.PaneID, "kind": agent.Kind, "status": agent.Status, "host": d.cfg.Host, "named": agent.Name != ""})
+	local := joinAddr(identity, d.cfg.Host)
+	names := d.wireNames()
+	// There is no single answer to "what is my address": a name is routable by the
+	// peer on the link that supplied it. Answer per link, and say plainly when the
+	// local form is only a local label.
+	return success(map[string]any{
+		"local": map[string]any{
+			"addr":     local,
+			"host":     d.cfg.Host,
+			"routable": localRoutable(names, d.cfg.Host),
+		},
+		"addresses":    agentAddresses(local, names),
+		"reachable_as": reachableAs(local, names),
+		"name":         agent.Name,
+		"pane_id":      agent.PaneID,
+		"kind":         agent.Kind,
+		"status":       agent.Status,
+		"named":        agent.Name != "",
+		"note":         "addressing is per link; prefer replying to the exact from address on a message",
+	})
 }
 
 func (d *daemon) handleStatus(ctx context.Context) map[string]any {
