@@ -233,13 +233,28 @@ func cmdStatus(args []string) error {
 	}
 	return printResult(res, *jsonOut, func(res map[string]any) string {
 		herdr, _ := res["herdr"].(map[string]any)
-		return fmt.Sprintf("%s: herdr %s protocol %s, %s agents; %s queued", valueString(res, "host"), valueString(herdr, "version"), valueNumber(herdr, "protocol"), valueNumber(herdr, "agents"), valueNumber(res, "queued"))
+		summary := fmt.Sprintf("%s: herdr %s protocol %s, %s agents; %s queued", valueString(res, "host"), valueString(herdr, "version"), valueNumber(herdr, "protocol"), valueNumber(herdr, "agents"), valueNumber(res, "queued"))
+		for _, raw := range valueMaps(res, "draft_holds") {
+			summary += fmt.Sprintf("\nholding %s since %s", valueString(raw, "pane_id"), valueString(raw, "at"))
+		}
+		return summary
 	})
 }
 
 func valueString(fields map[string]any, name string) string {
 	value, _ := fields[name].(string)
 	return value
+}
+
+func valueMaps(fields map[string]any, name string) []map[string]any {
+	values, _ := fields[name].([]any)
+	out := make([]map[string]any, 0, len(values))
+	for _, value := range values {
+		if object, ok := value.(map[string]any); ok {
+			out = append(out, object)
+		}
+	}
+	return out
 }
 
 // valueStrings reads a JSON string array, tolerating both a decoded []any (the

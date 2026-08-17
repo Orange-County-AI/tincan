@@ -16,6 +16,14 @@ import (
 
 // daemon owns the one writer to the local spool and the one connection point
 // for herdr and peer links.
+type draftHold struct {
+	PaneID string    `json:"pane_id"`
+	Agent  string    `json:"agent"`
+	At     time.Time `json:"at"`
+}
+
+// daemon owns the one writer to the local spool and the one connection point
+// for herdr and peer links.
 type daemon struct {
 	cfg   *Config
 	store *Store
@@ -29,15 +37,19 @@ type daemon struct {
 	rosterMu sync.RWMutex
 	roster   map[string]herdrAgent
 	agents   []herdrAgent
+
+	holdMu     sync.RWMutex
+	draftHolds map[string]draftHold
 }
 
 func newDaemon(cfg *Config, store *Store, herdr herdrDriver) *daemon {
 	return &daemon{
-		cfg:     cfg,
-		store:   store,
-		herdr:   herdr,
-		started: time.Now(),
-		roster:  make(map[string]herdrAgent),
+		cfg:        cfg,
+		store:      store,
+		herdr:      herdr,
+		started:    time.Now(),
+		roster:     make(map[string]herdrAgent),
+		draftHolds: make(map[string]draftHold),
 	}
 }
 
@@ -256,6 +268,26 @@ func (d *daemon) dispatch(ctx context.Context, now time.Time) {
 		return
 	}
 	for _, key := range keys {
+		// Keep draft-held work pending, so neither its retry state nor its
+		// delivery order changes while a person is typing in the target pane.
+		if draftGuardEnabled() {
+			claimable, err := d.store.HasClaimableLocal(key, now)
+			if err != nil {
+				d.Logf("peek %s: %v", key, err)
+				continue
+			}
+			if !claimable {
+				d.releaseDraftHold(key)
+				continue
+			}
+			if hold := d.composerHold(ctx, key); hold != nil {
+				d.applyDraftHold(key, *hold)
+				continue
+			}
+			d.releaseDraftHold(key)
+		} else {
+			d.releaseDraftHold(key)
+		}
 		claim, err := d.store.ClaimLocal(key, now)
 		if err != nil {
 			d.Logf("claim %s: %v", key, err)
@@ -266,6 +298,67 @@ func (d *daemon) dispatch(ctx context.Context, now time.Time) {
 		}
 		d.dispatchClaim(ctx, key, claim, now)
 	}
+}
+
+// composerHold uses agent.get rather than the cached roster so the pane and
+// harness kind describe the exact target about to receive a prompt.
+func (d *daemon) composerHold(ctx context.Context, key string) *draftHold {
+	agent, cached := d.resolve(key)
+	if !cached {
+		return nil
+	}
+	target := agent.Name
+	if strings.HasPrefix(key, "p-") || target == "" {
+		target = agent.PaneID
+	}
+	if target == "" {
+		return nil
+	}
+	probe, err := d.herdr.GetAgent(ctx, target)
+	if err != nil || probe == nil || probe.PaneID == "" {
+		return nil
+	}
+	screen, err := d.herdr.PaneScreen(ctx, probe.PaneID)
+	if err != nil || DetectComposer(probe.Kind, screen) != ComposerDraft {
+		return nil
+	}
+	return &draftHold{PaneID: probe.PaneID, Agent: probe.Kind, At: time.Now().UTC()}
+}
+
+func (d *daemon) applyDraftHold(key string, hold draftHold) {
+	d.holdMu.Lock()
+	_, alreadyHeld := d.draftHolds[key]
+	d.draftHolds[key] = hold
+	d.holdMu.Unlock()
+	if !alreadyHeld {
+		d.Logf("delivery held — %s has unsent input in pane %s; retrying until the composer is clear", hold.Agent, hold.PaneID)
+	}
+}
+
+func (d *daemon) releaseDraftHold(key string) {
+	d.holdMu.Lock()
+	hold, held := d.draftHolds[key]
+	delete(d.draftHolds, key)
+	d.holdMu.Unlock()
+	if held {
+		d.Logf("delivery resumed — pane %s composer is clear", hold.PaneID)
+	}
+}
+
+func (d *daemon) draftHoldStatus() []draftHold {
+	d.holdMu.RLock()
+	holds := make([]draftHold, 0, len(d.draftHolds))
+	for _, hold := range d.draftHolds {
+		holds = append(holds, hold)
+	}
+	d.holdMu.RUnlock()
+	sort.Slice(holds, func(i, j int) bool { return holds[i].PaneID < holds[j].PaneID })
+	return holds
+}
+
+func draftGuardEnabled() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("TINCAN_DRAFT_GUARD")))
+	return value != "0" && value != "false"
 }
 
 func (d *daemon) dispatchClaim(ctx context.Context, key string, claim *Claimed, now time.Time) {
@@ -733,6 +826,6 @@ func (d *daemon) handleStatus(ctx context.Context) map[string]any {
 	return success(map[string]any{
 		"host": d.cfg.Host, "uptime_s": int64(time.Since(d.started).Seconds()),
 		"herdr":  map[string]any{"version": d.version, "protocol": d.proto, "agents": d.agentCount()},
-		"queued": queued, "outbox": outbox, "links": links,
+		"queued": queued, "outbox": outbox, "links": links, "draft_holds": d.draftHoldStatus(),
 	})
 }

@@ -31,6 +31,7 @@ type herdrDriver interface {
 	Ping(ctx context.Context) (version string, protocol int, err error)
 	ListAgents(ctx context.Context) ([]herdrAgent, error)
 	GetAgent(ctx context.Context, target string) (*herdrAgent, error)
+	PaneScreen(ctx context.Context, paneID string) (string, error)
 	Prompt(ctx context.Context, target, text string) error
 	Rename(ctx context.Context, target, name string) (*herdrAgent, error)
 }
@@ -137,6 +138,33 @@ func (d *herdrSocket) GetAgent(ctx context.Context, target string) (*herdrAgent,
 		return nil, err
 	}
 	return decodeHerdrAgent(raw, "agent.get")
+}
+
+// PaneScreen returns the human-visible pane, including a harness composer.
+// lines must be omitted: herdr treats lines=0 as an empty screen.
+func (d *herdrSocket) PaneScreen(ctx context.Context, paneID string) (string, error) {
+	raw, err := d.call(ctx, "pane.read", map[string]any{
+		"pane_id":    paneID,
+		"source":     "visible",
+		"format":     "text",
+		"strip_ansi": true,
+	})
+	if err != nil {
+		return "", fmt.Errorf("herdr pane read %s: %w", paneID, err)
+	}
+	var result struct {
+		Type string `json:"type"`
+		Read *struct {
+			Text string `json:"text"`
+		} `json:"read"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return "", fmt.Errorf("decode herdr pane read %s: %w", paneID, err)
+	}
+	if result.Type != "pane_read" || result.Read == nil {
+		return "", fmt.Errorf("unexpected herdr pane read %s response", paneID)
+	}
+	return result.Read.Text, nil
 }
 
 func (d *herdrSocket) Prompt(ctx context.Context, target, text string) error {

@@ -265,6 +265,36 @@ func TestHerdrPrompt(t *testing.T) {
 	}
 }
 
+func TestHerdrPaneScreenReadsVisibleTextWithoutLines(t *testing.T) {
+	driver := newHerdrTestDriver(t, 19, func(request herdrWireRequest) herdrTestReply {
+		if request.Method != "pane.read" {
+			t.Errorf("method = %q, want pane.read", request.Method)
+		}
+		params, ok := request.Params.(map[string]any)
+		if !ok {
+			t.Errorf("params type = %T, want map", request.Params)
+			params = map[string]any{}
+		}
+		if params["pane_id"] != "w1:p1" || params["source"] != "visible" || params["format"] != "text" || params["strip_ansi"] != true {
+			t.Errorf("pane.read params = %#v", params)
+		}
+		if _, found := params["lines"]; found {
+			t.Errorf("pane.read must omit lines: %#v", params)
+		}
+		return herdrTestReply{result: map[string]any{
+			"type": "pane_read",
+			"read": map[string]any{"text": "visible composer"},
+		}}
+	})
+	screen, err := driver.PaneScreen(context.Background(), "w1:p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if screen != "visible composer" {
+		t.Fatalf("PaneScreen() = %q", screen)
+	}
+}
+
 func TestHerdrTransportErrorsAreUncoded(t *testing.T) {
 	tests := []struct {
 		name string

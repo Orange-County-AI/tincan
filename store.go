@@ -299,6 +299,35 @@ func (s *Store) ClaimLocal(key string, now time.Time) (*Claimed, error) {
 	return s.claim(s.queueDir(key), now)
 }
 
+// HasClaimableLocal reports whether the local queue has work due now without
+// claiming it. A delivery guard uses this to avoid reading panes for empty
+// queues and to preserve the queued message untouched when it must hold.
+func (s *Store) HasClaimableLocal(key string, now time.Time) (bool, error) {
+	dir := s.queueDir(key)
+	var claimable bool
+	err := s.withLock(func() error {
+		names, err := pendingNames(dir)
+		if err != nil {
+			return err
+		}
+		for _, name := range names {
+			if !strings.HasPrefix(name, "msg-") {
+				continue
+			}
+			message, err := readMsg(filepath.Join(dir, name))
+			if err != nil {
+				return fmt.Errorf("read queued message %s: %w", filepath.Join(dir, name), err)
+			}
+			if s.Eligible(message, now) {
+				claimable = true
+				return nil
+			}
+		}
+		return nil
+	})
+	return claimable, err
+}
+
 func (s *Store) ClaimOutbox(host string, now time.Time) (*Claimed, error) {
 	return s.claim(s.outboxDir(host), now)
 }

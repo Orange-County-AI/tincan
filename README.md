@@ -126,7 +126,7 @@ A peer is dialable when it has either `ssh` or `dial`. `bin` defaults to `~/.loc
 | `TINCAN_POLL_SECONDS` | Roster polling interval; default 2 seconds. |
 | `TINCAN_HERDR_SOCKET` | Herdr socket path when configuration omits `herdr_socket`. |
 | `TINCAN_HERDR_PROTOCOL_ALLOW` | Comma-separated extra accepted herdr protocol versions; defaults include 19 and 20. |
-
+| `TINCAN_DRAFT_GUARD` | Set to `0` or `false` to disable the default-on guard that waits for an empty supported-harness composer before delivery. |
 Herdr socket resolution is: config `herdr_socket`, `TINCAN_HERDR_SOCKET`, `HERDR_SOCKET_PATH`, `$XDG_CONFIG_HOME/herdr/herdr.sock`, then `~/.config/herdr/herdr.sock`.
 
 ## State on disk

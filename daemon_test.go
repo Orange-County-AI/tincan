@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -18,10 +19,12 @@ type recordedPrompt struct {
 }
 
 type fakeDaemonHerdr struct {
-	mu        sync.Mutex
-	agents    []herdrAgent
-	prompts   []recordedPrompt
-	promptErr error
+	mu            sync.Mutex
+	agents        []herdrAgent
+	prompts       []recordedPrompt
+	promptErr     error
+	paneScreens   map[string]string
+	paneScreenErr error
 }
 
 func (f *fakeDaemonHerdr) Ping(context.Context) (string, int, error) { return "test", 19, nil }
@@ -42,6 +45,19 @@ func (f *fakeDaemonHerdr) GetAgent(_ context.Context, target string) (*herdrAgen
 		}
 	}
 	return nil, nil
+}
+
+func (f *fakeDaemonHerdr) PaneScreen(_ context.Context, paneID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.paneScreenErr != nil {
+		return "", f.paneScreenErr
+	}
+	screen, found := f.paneScreens[paneID]
+	if !found {
+		return "", errors.New("pane screen not configured")
+	}
+	return screen, nil
 }
 
 func (f *fakeDaemonHerdr) Prompt(_ context.Context, target, text string) error {
@@ -87,7 +103,7 @@ func newTestDaemon(t *testing.T, cfg *Config, agents ...herdrAgent) (*daemon, *f
 	if err != nil {
 		t.Fatal(err)
 	}
-	herdr := &fakeDaemonHerdr{agents: agents}
+	herdr := &fakeDaemonHerdr{agents: agents, paneScreens: make(map[string]string)}
 	d := newDaemon(cfg, st, herdr)
 	if err := d.refreshRoster(context.Background()); err != nil {
 		t.Fatal(err)
@@ -126,6 +142,82 @@ func TestDaemonSendsAndArchivesRenderedEnvelope(t *testing.T) {
 	}
 	if queued != 0 {
 		t.Fatalf("queued = %d, want 0", queued)
+	}
+}
+func TestDaemonDraftHoldPreservesQueueAndResumes(t *testing.T) {
+	d, herdr := newTestDaemon(t, nil, herdrAgent{Name: "clem", PaneID: "w7K:p2", Kind: "claude", Status: "idle"})
+	herdr.paneScreens["w7K:p2"] = readScreenFixture(t, "claude-draft.txt")
+	id := sendForTest(t, d, map[string]any{"to": "clem", "body": "hello", "from": "ci"})
+
+	dir := d.store.queueDir(queueKey("clem"))
+	names, err := pendingNames(dir)
+	if err != nil || len(names) != 1 {
+		t.Fatalf("queued names before hold = %v, %v", names, err)
+	}
+	before, err := readMsg(filepath.Join(dir, names[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	d.dispatch(context.Background(), now)
+
+	if prompts := herdr.promptsSnapshot(); len(prompts) != 0 {
+		t.Fatalf("prompts while draft is present = %#v", prompts)
+	}
+	names, err = pendingNames(dir)
+	if err != nil || len(names) != 1 {
+		t.Fatalf("queued names after hold = %v, %v", names, err)
+	}
+	after, err := readMsg(filepath.Join(dir, names[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("held queue message changed: got %#v, want %#v", after, before)
+	}
+	if hold := d.draftHoldStatus(); len(hold) != 1 || hold[0].PaneID != "w7K:p2" {
+		t.Fatalf("draft holds = %#v", hold)
+	}
+
+	herdr.paneScreens["w7K:p2"] = readScreenFixture(t, "claude-empty.txt")
+	d.dispatch(context.Background(), now)
+	if prompts := herdr.promptsSnapshot(); len(prompts) != 1 || prompts[0].target != "clem" {
+		t.Fatalf("prompts after composer clears = %#v", prompts)
+	}
+	if _, err := d.store.History(id); err != nil {
+		t.Fatalf("resumed delivery was not archived: %v", err)
+	}
+	if hold := d.draftHoldStatus(); len(hold) != 0 {
+		t.Fatalf("draft holds after release = %#v", hold)
+	}
+}
+
+func TestDaemonDraftGuardCanBeDisabled(t *testing.T) {
+	t.Setenv("TINCAN_DRAFT_GUARD", "false")
+	d, herdr := newTestDaemon(t, nil, herdrAgent{Name: "clem", PaneID: "w7K:p2", Kind: "claude", Status: "idle"})
+	herdr.paneScreens["w7K:p2"] = readScreenFixture(t, "claude-draft.txt")
+	id := sendForTest(t, d, map[string]any{"to": "clem", "body": "hello", "from": "ci"})
+	d.dispatch(context.Background(), time.Now())
+
+	if prompts := herdr.promptsSnapshot(); len(prompts) != 1 {
+		t.Fatalf("prompts with draft guard disabled = %#v", prompts)
+	}
+	if _, err := d.store.History(id); err != nil {
+		t.Fatalf("disabled guard delivery was not archived: %v", err)
+	}
+}
+
+func TestDaemonUnreadablePaneScreenFailsOpen(t *testing.T) {
+	d, herdr := newTestDaemon(t, nil, herdrAgent{Name: "clem", PaneID: "w7K:p2", Kind: "claude", Status: "idle"})
+	herdr.paneScreenErr = errors.New("pane read failed")
+	id := sendForTest(t, d, map[string]any{"to": "clem", "body": "hello", "from": "ci"})
+	d.dispatch(context.Background(), time.Now())
+
+	if prompts := herdr.promptsSnapshot(); len(prompts) != 1 {
+		t.Fatalf("prompts after unreadable pane = %#v", prompts)
+	}
+	if _, err := d.store.History(id); err != nil {
+		t.Fatalf("fail-open delivery was not archived: %v", err)
 	}
 }
 
