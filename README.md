@@ -64,7 +64,9 @@ tincan daemon
 | `tincan read ID [--json]` | Read a delivered message body retained in history. |
 | `tincan name NAME` | Rename the current herdr agent to a stable name. |
 | `tincan whoami [--json]` | Report the calling pane's current address and identity. |
-| `tincan status [--json]` | Report daemon uptime, herdr protocol, spool counts, and links. |
+| `tincan status [--json]` | Report daemon uptime, herdr protocol, spool counts, draft holds, pause state, and links. |
+| `tincan inbox [--pane ID] [--json] [--watch]` | List pending local messages, optionally for a pane; `--watch` runs the interactive inbox pane. |
+| `tincan pause [--on|--off|--toggle]` | Pause or resume local delivery; no flag toggles the current state. |
 | `tincan link` | Internal stdio endpoint used by ssh peers; it autostarts the local daemon when necessary. |
 | `tincan mcp` | Run the stdio JSON-RPC MCP endpoint. |
 
@@ -127,6 +129,7 @@ A peer is dialable when it has either `ssh` or `dial`. `bin` defaults to `~/.loc
 | `TINCAN_HERDR_SOCKET` | Herdr socket path when configuration omits `herdr_socket`. |
 | `TINCAN_HERDR_PROTOCOL_ALLOW` | Comma-separated extra accepted herdr protocol versions; defaults include 19 and 20. |
 | `TINCAN_DRAFT_GUARD` | Set to `0` or `false` to disable the default-on guard that waits for an empty supported-harness composer before delivery. |
+| `TINCAN_DRAFT_NOTIFY` | Set to `0` or `false` to disable the default-on held-delivery notification. |
 Herdr socket resolution is: config `herdr_socket`, `TINCAN_HERDR_SOCKET`, `HERDR_SOCKET_PATH`, `$XDG_CONFIG_HOME/herdr/herdr.sock`, then `~/.config/herdr/herdr.sock`.
 
 ## State on disk

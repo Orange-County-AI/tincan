@@ -25,6 +25,8 @@ type fakeDaemonHerdr struct {
 	promptErr     error
 	paneScreens   map[string]string
 	paneScreenErr error
+	notifications []recordedNotification
+	notifyErr     error
 }
 
 func (f *fakeDaemonHerdr) Ping(context.Context) (string, int, error) { return "test", 19, nil }
@@ -80,6 +82,18 @@ func (f *fakeDaemonHerdr) Rename(_ context.Context, target, name string) (*herdr
 	return nil, codedErrorf("agent_not_found", "agent %q was not found", target)
 }
 
+type recordedNotification struct {
+	title string
+	body  string
+}
+
+func (f *fakeDaemonHerdr) Notify(_ context.Context, title, body string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notifications = append(f.notifications, recordedNotification{title: title, body: body})
+	return f.notifyErr
+}
+
 func (f *fakeDaemonHerdr) setAgents(agents ...herdrAgent) {
 	f.mu.Lock()
 	f.agents = append([]herdrAgent(nil), agents...)
@@ -90,6 +104,12 @@ func (f *fakeDaemonHerdr) promptsSnapshot() []recordedPrompt {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]recordedPrompt(nil), f.prompts...)
+}
+
+func (f *fakeDaemonHerdr) notificationsSnapshot() []recordedNotification {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]recordedNotification(nil), f.notifications...)
 }
 
 func newTestDaemon(t *testing.T, cfg *Config, agents ...herdrAgent) (*daemon, *fakeDaemonHerdr) {
@@ -489,6 +509,126 @@ func TestAgentsListsReplyOnlySenders(t *testing.T) {
 	}
 	wire := map[string]any{"agents": []any{}, "reply_only": []any{map[string]any{"addr": "main@titan", "host": "titan", "via": "inbound"}}}
 	if text := renderAgents(wire); !contains(text, "main@titan") || !contains(text, "reply-only") {
+
 		t.Fatalf("agents render = %q, must name reply-only senders", text)
+	}
+}
+func TestDaemonInboxRowsResolvePaneQueues(t *testing.T) {
+	d, _ := newTestDaemon(t, nil, herdrAgent{Name: "clem", PaneID: "w7K:p2", Kind: "omp", Status: "idle"})
+	byName := testMsg("inbox-name01", "clem")
+	byName.From = "dana@titan"
+	byPane := testMsg("inbox-pane01", "w7K:p2")
+	byPane.From = "tester@titan"
+	byPane.TS = byPane.TS.Add(time.Second)
+	if err := d.store.EnqueueLocal(byName); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.store.EnqueueLocal(byPane); err != nil {
+		t.Fatal(err)
+	}
+	if claim, err := d.store.ClaimLocal(queueKey("clem"), byName.TS); err != nil || claim == nil {
+		t.Fatalf("ClaimLocal = %#v, %v", claim, err)
+	}
+
+	res := d.handle(context.Background(), map[string]any{"op": "inbox", "pane_id": "w7K:p2"})
+	if !valueBool(res, "ok") {
+		t.Fatalf("inbox = %#v", res)
+	}
+	rows, _ := res["rows"].([]map[string]any)
+	if len(rows) != 2 {
+		t.Fatalf("rows = %#v, want both named and pane queues", rows)
+	}
+	states := map[string]string{}
+	for _, row := range rows {
+		states[valueString(row, "id")] = valueString(row, "state")
+	}
+	if states[byName.ID] != "claimed" || states[byPane.ID] != "pending" {
+		t.Fatalf("inbox states = %#v", states)
+	}
+
+	all := d.handle(context.Background(), map[string]any{"op": "inbox"})
+	allRows, _ := all["rows"].([]map[string]any)
+	if len(allRows) != 2 {
+		t.Fatalf("all inbox rows = %#v, want every local queue", allRows)
+	}
+}
+
+func TestDaemonPauseIPCStopsDispatch(t *testing.T) {
+	d, herdr := newTestDaemon(t, nil, herdrAgent{Name: "clem", PaneID: "w7K:p2", Kind: "omp", Status: "idle"})
+	message := testMsg("pause0000001", "clem")
+	if err := d.store.EnqueueLocal(message); err != nil {
+		t.Fatal(err)
+	}
+	if res := d.handle(context.Background(), map[string]any{"op": "pause", "paused": true}); !valueBool(res, "ok") || !valueBool(res, "paused") {
+		t.Fatalf("pause response = %#v", res)
+	}
+	if !valueBool(d.handleStatus(context.Background()), "paused") {
+		t.Fatal("status did not report paused")
+	}
+	d.dispatch(context.Background(), time.Now())
+	if prompts := herdr.promptsSnapshot(); len(prompts) != 0 {
+		t.Fatalf("prompts while paused = %#v", prompts)
+	}
+	messages, names, err := d.store.ListLocalPending(queueKey("clem"))
+	if err != nil || len(messages) != 1 || !strings.HasPrefix(names[0], "msg-") || messages[0].Attempts != 0 {
+		t.Fatalf("pending after paused dispatch = %#v, %#v, %v", messages, names, err)
+	}
+	if res := d.handle(context.Background(), map[string]any{"op": "pause", "paused": "yes"}); valueString(res, "code") != "bad_request" {
+		t.Fatalf("non-boolean pause response = %#v", res)
+	}
+}
+
+func TestDaemonDraftHoldNotifiesOnce(t *testing.T) {
+	d, herdr := newTestDaemon(t, nil, herdrAgent{Name: "clem", PaneID: "w7K:p2", Kind: "omp", Status: "idle"})
+	first := testMsg("notice000001", "clem")
+	first.From = "dana@titan"
+	second := testMsg("notice000002", "clem")
+	second.From = "alex@titan"
+	second.TS = second.TS.Add(time.Second)
+	if err := d.store.EnqueueLocal(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.store.EnqueueLocal(second); err != nil {
+		t.Fatal(err)
+	}
+	hold := draftHold{PaneID: "w7K:p2", Agent: "omp", At: time.Now()}
+	d.applyDraftHold(context.Background(), queueKey("clem"), hold)
+	d.applyDraftHold(context.Background(), queueKey("clem"), hold)
+	notifications := herdr.notificationsSnapshot()
+	if len(notifications) != 1 || notifications[0].title != "tincan: message waiting" ||
+		notifications[0].body != "dana@titan — 2 waiting until your composer is clear" {
+		t.Fatalf("notifications = %#v", notifications)
+	}
+}
+
+func TestDaemonDraftNotifyCanBeDisabled(t *testing.T) {
+	t.Setenv("TINCAN_DRAFT_NOTIFY", "false")
+	d, herdr := newTestDaemon(t, nil, herdrAgent{Name: "clem", PaneID: "w7K:p2", Kind: "omp", Status: "idle"})
+	message := testMsg("notice-off01", "clem")
+	if err := d.store.EnqueueLocal(message); err != nil {
+		t.Fatal(err)
+	}
+	d.applyDraftHold(context.Background(), queueKey("clem"), draftHold{PaneID: "w7K:p2", Agent: "omp", At: time.Now()})
+	if notifications := herdr.notificationsSnapshot(); len(notifications) != 0 {
+		t.Fatalf("notifications = %#v, want none", notifications)
+	}
+}
+
+func TestDaemonDraftHoldNotifyFailureDoesNotBlockDelivery(t *testing.T) {
+	d, herdr := newTestDaemon(t, nil, herdrAgent{Name: "clem", PaneID: "w7K:p2", Kind: "claude", Status: "idle"})
+	herdr.notifyErr = errors.New("notification unavailable")
+	herdr.paneScreens["w7K:p2"] = readScreenFixture(t, "claude-draft.txt")
+	id := sendForTest(t, d, map[string]any{"to": "clem", "body": "hello", "from": "ci"})
+	d.dispatch(context.Background(), time.Now())
+	if got := len(herdr.notificationsSnapshot()); got != 1 {
+		t.Fatalf("notifications = %d, want 1", got)
+	}
+	herdr.paneScreens["w7K:p2"] = readScreenFixture(t, "claude-empty.txt")
+	d.dispatch(context.Background(), time.Now())
+	if got := len(herdr.promptsSnapshot()); got != 1 {
+		t.Fatalf("prompts after notification failure = %d", got)
+	}
+	if _, err := d.store.History(id); err != nil {
+		t.Fatalf("history after notification failure: %v", err)
 	}
 }

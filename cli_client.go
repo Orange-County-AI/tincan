@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 func newFlagSet(name string) *flag.FlagSet {
@@ -241,20 +244,245 @@ func cmdStatus(args []string) error {
 	})
 }
 
+func cmdInbox(args []string) error {
+	fs := newFlagSet("inbox")
+	paneID := fs.String("pane", "", "limit to a herdr pane")
+	jsonOut := fs.Bool("json", false, "print JSON")
+	watch := fs.Bool("watch", false, "watch inbox in a pane")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || (*watch && *jsonOut) {
+		return fmt.Errorf("usage: tincan inbox [--pane ID] [--json] [--watch]")
+	}
+	if *watch {
+		localAddr := "local"
+		if currentPane := os.Getenv("HERDR_PANE_ID"); currentPane != "" {
+			if whoami, err := daemonCall(map[string]any{"op": "whoami", "pane_id": currentPane}); err == nil && daemonResponseError(whoami) == nil {
+				if local, ok := whoami["local"].(map[string]any); ok && valueString(local, "addr") != "" {
+					localAddr = valueString(local, "addr")
+				}
+			}
+		}
+		return runInbox(os.Stdin, os.Stdout, *paneID, localAddr, daemonCall)
+	}
+	res, err := daemonCall(map[string]any{"op": "inbox", "pane_id": *paneID})
+	if err != nil {
+		return err
+	}
+	return printResult(res, *jsonOut, renderInboxRows)
+}
+
+func cmdPause(args []string) error {
+	fs := newFlagSet("pause")
+	on := fs.Bool("on", false, "pause delivery")
+	off := fs.Bool("off", false, "resume delivery")
+	toggle := fs.Bool("toggle", false, "toggle delivery pause")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || boolCount(*on, *off, *toggle) > 1 {
+		return fmt.Errorf("usage: tincan pause [--on|--off|--toggle]")
+	}
+	paused := *on
+	if !*on {
+		if *off {
+			paused = false
+		} else {
+			status, err := daemonCall(map[string]any{"op": "status"})
+			if err != nil {
+				return err
+			}
+			if err := daemonResponseError(status); err != nil {
+				return err
+			}
+			paused = !valueBool(status, "paused")
+		}
+	}
+	res, err := daemonCall(map[string]any{"op": "pause", "paused": paused})
+	if err != nil {
+		return err
+	}
+	return printResult(res, false, func(res map[string]any) string {
+		if valueBool(res, "paused") {
+			return "paused"
+		}
+		return "resumed"
+	})
+}
+
+func boolCount(values ...bool) int {
+	count := 0
+	for _, value := range values {
+		if value {
+			count++
+		}
+	}
+	return count
+}
+
+func daemonResponseError(res map[string]any) error {
+	if valueBool(res, "ok") {
+		return nil
+	}
+	if message := valueString(res, "error"); message != "" {
+		return fmt.Errorf("%s", message)
+	}
+	return fmt.Errorf("request failed")
+}
+
+type inboxCall func(map[string]any) (map[string]any, error)
+
+func runInbox(in io.Reader, out io.Writer, paneID, localAddr string, call inboxCall) error {
+	scanner := bufio.NewScanner(in)
+	status := ""
+	for {
+		res, err := call(map[string]any{"op": "inbox", "pane_id": paneID})
+		if err == nil {
+			err = daemonResponseError(res)
+		}
+		if err != nil {
+			renderInboxFrame(out, localAddr, nil, "error: "+err.Error())
+		} else {
+			renderInboxFrame(out, localAddr, res, status)
+		}
+		if !scanner.Scan() {
+			return scanner.Err()
+		}
+		command := strings.TrimSpace(scanner.Text())
+		switch command {
+		case "q":
+			return nil
+		case "":
+			status = ""
+		case "p":
+			if err != nil {
+				status = "error: " + err.Error()
+				continue
+			}
+			nextPaused := !valueBool(res, "paused")
+			pausedRes, pauseErr := call(map[string]any{"op": "pause", "paused": nextPaused})
+			if pauseErr == nil {
+				pauseErr = daemonResponseError(pausedRes)
+			}
+			if pauseErr != nil {
+				status = "error: " + pauseErr.Error()
+			} else if valueBool(pausedRes, "paused") {
+				status = "paused"
+			} else {
+				status = "resumed"
+			}
+		default:
+			status = "unknown command: " + command
+		}
+	}
+}
+
+func renderInboxRows(res map[string]any) string {
+	rows := valueMaps(res, "rows")
+	if len(rows) == 0 {
+		return "no messages waiting"
+	}
+	previewWidth := inboxPreviewWidth()
+	lines := make([]string, 0, len(rows))
+	for index, row := range rows {
+		lines = append(lines, fmt.Sprintf("%3d  %-6s  %-20s  %-9s  %s",
+			index+1, inboxAge(valueString(row, "ts")), truncateInbox(valueString(row, "from"), 20),
+			valueString(row, "state"), truncateInbox(valueString(row, "preview"), previewWidth)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderInboxFrame(out io.Writer, localAddr string, res map[string]any, status string) {
+	header := "tincan inbox — " + localAddr
+	if res != nil {
+		holds := valueMaps(res, "draft_holds")
+		if len(holds) > 0 {
+			header += fmt.Sprintf(" — held: pane %s (%s)", valueString(holds[0], "pane_id"), valueString(holds[0], "agent"))
+		} else {
+			header += " — delivering"
+		}
+		if valueBool(res, "paused") {
+			header += "  [paused]"
+		}
+	} else {
+		header += " — delivering"
+	}
+	fmt.Fprint(out, "\x1b[2J\x1b[H", header, "\n\n")
+	if res != nil {
+		rows := valueMaps(res, "rows")
+		if len(rows) == 0 {
+			fmt.Fprintln(out, "no messages waiting")
+		} else {
+			fmt.Fprintln(out, "  #  age     from                  state      preview")
+			fmt.Fprintln(out, renderInboxRows(res))
+		}
+	}
+	fmt.Fprint(out, "\n", status, "\n[enter] refresh   [p] pause/resume   [q] quit\n")
+}
+
+func inboxAge(raw string) string {
+	then, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return "—"
+	}
+	age := time.Since(then)
+	switch {
+	case age < time.Minute:
+		return strconv.FormatInt(int64(age.Seconds()), 10) + "s"
+	case age < time.Hour:
+		return strconv.FormatInt(int64(age.Minutes()), 10) + "m"
+	case age < 24*time.Hour:
+		return strconv.FormatInt(int64(age.Hours()), 10) + "h"
+	default:
+		return strconv.FormatInt(int64(age.Hours()/24), 10) + "d"
+	}
+}
+
+func truncateInbox(text string, width int) string {
+	runes := []rune(text)
+	if len(runes) <= width {
+		return text
+	}
+	if width <= 1 {
+		return string(runes[:width])
+	}
+	return string(runes[:width-1]) + "…"
+}
+
+func inboxPreviewWidth() int {
+	const defaultColumns = 100
+	columns := defaultColumns
+	if value, err := strconv.Atoi(os.Getenv("COLUMNS")); err == nil && value > 0 {
+		columns = value
+	}
+	// The fixed columns and their separating spaces consume 46 characters.
+	if columns-46 < 1 {
+		return 1
+	}
+	return columns - 46
+}
+
 func valueString(fields map[string]any, name string) string {
 	value, _ := fields[name].(string)
 	return value
 }
 
 func valueMaps(fields map[string]any, name string) []map[string]any {
-	values, _ := fields[name].([]any)
-	out := make([]map[string]any, 0, len(values))
-	for _, value := range values {
-		if object, ok := value.(map[string]any); ok {
-			out = append(out, object)
+	switch values := fields[name].(type) {
+	case []map[string]any:
+		return append([]map[string]any(nil), values...)
+	case []any:
+		out := make([]map[string]any, 0, len(values))
+		for _, value := range values {
+			if object, ok := value.(map[string]any); ok {
+				out = append(out, object)
+			}
 		}
+		return out
+	default:
+		return nil
 	}
-	return out
 }
 
 // valueStrings reads a JSON string array, tolerating both a decoded []any (the

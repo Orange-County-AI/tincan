@@ -40,6 +40,7 @@ type daemon struct {
 
 	holdMu     sync.RWMutex
 	draftHolds map[string]draftHold
+	paused     bool
 }
 
 func newDaemon(cfg *Config, store *Store, herdr herdrDriver) *daemon {
@@ -262,6 +263,12 @@ func (d *daemon) localRoster() []RosterAgent {
 func targetAddr(agent, host string) string { return joinAddr(agent, host) }
 
 func (d *daemon) dispatch(ctx context.Context, now time.Time) {
+	d.holdMu.RLock()
+	paused := d.paused
+	d.holdMu.RUnlock()
+	if paused {
+		return
+	}
 	keys, err := d.store.QueueKeys()
 	if err != nil {
 		d.Logf("list queues: %v", err)
@@ -281,7 +288,7 @@ func (d *daemon) dispatch(ctx context.Context, now time.Time) {
 				continue
 			}
 			if hold := d.composerHold(ctx, key); hold != nil {
-				d.applyDraftHold(key, *hold)
+				d.applyDraftHold(ctx, key, *hold)
 				continue
 			}
 			d.releaseDraftHold(key)
@@ -325,13 +332,27 @@ func (d *daemon) composerHold(ctx context.Context, key string) *draftHold {
 	return &draftHold{PaneID: probe.PaneID, Agent: probe.Kind, At: time.Now().UTC()}
 }
 
-func (d *daemon) applyDraftHold(key string, hold draftHold) {
+func (d *daemon) applyDraftHold(ctx context.Context, key string, hold draftHold) {
 	d.holdMu.Lock()
 	_, alreadyHeld := d.draftHolds[key]
 	d.draftHolds[key] = hold
 	d.holdMu.Unlock()
-	if !alreadyHeld {
-		d.Logf("delivery held — %s has unsent input in pane %s; retrying until the composer is clear", hold.Agent, hold.PaneID)
+	if alreadyHeld {
+		return
+	}
+	d.Logf("delivery held — %s has unsent input in pane %s; retrying until the composer is clear", hold.Agent, hold.PaneID)
+	if !draftNotifyEnabled() {
+		return
+	}
+	// One toast on the same edge the log line is written: a held message is
+	// otherwise invisible, and re-notifying every second would train the human to
+	// ignore it. A notification is an extra — its failure never holds delivery.
+	body := "delivery held until your composer is clear"
+	if messages, _, err := d.store.ListLocalPending(key); err == nil && len(messages) > 0 {
+		body = fmt.Sprintf("%s — %d waiting until your composer is clear", messages[0].From, len(messages))
+	}
+	if err := d.herdr.Notify(ctx, "tincan: message waiting", body); err != nil {
+		d.Logf("notify failed — %v", err)
 	}
 }
 
@@ -356,8 +377,25 @@ func (d *daemon) draftHoldStatus() []draftHold {
 	return holds
 }
 
+func (d *daemon) setPaused(paused bool) {
+	d.holdMu.Lock()
+	d.paused = paused
+	d.holdMu.Unlock()
+}
+
+func (d *daemon) isPaused() bool {
+	d.holdMu.RLock()
+	defer d.holdMu.RUnlock()
+	return d.paused
+}
+
 func draftGuardEnabled() bool {
 	value := strings.ToLower(strings.TrimSpace(os.Getenv("TINCAN_DRAFT_GUARD")))
+	return value != "0" && value != "false"
+}
+
+func draftNotifyEnabled() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("TINCAN_DRAFT_NOTIFY")))
 	return value != "0" && value != "false"
 }
 
@@ -546,9 +584,89 @@ func (d *daemon) handle(ctx context.Context, req map[string]any) map[string]any 
 		return d.handleWhoami(ctx, req)
 	case "status":
 		return d.handleStatus(ctx)
+	case "pause":
+		return d.handlePause(req)
+	case "inbox":
+		return d.handleInbox(ctx, req)
 	default:
 		return failure(codedErrorf("bad_request", "unknown operation %q", stringField(req, "op")))
 	}
+}
+
+func (d *daemon) handlePause(req map[string]any) map[string]any {
+	paused, ok := req["paused"].(bool)
+	if !ok {
+		return failure(codedErrorf("bad_request", "paused must be a boolean"))
+	}
+	d.setPaused(paused)
+	return success(map[string]any{"paused": paused})
+}
+
+func inboxPreview(body string) string {
+	runes := []rune(body)
+	if len(runes) <= 100 {
+		return body
+	}
+	return string(runes[:100]) + "…"
+}
+
+func (d *daemon) handleInbox(ctx context.Context, req map[string]any) map[string]any {
+	paneID := stringField(req, "pane_id")
+	keys := []string{}
+	if paneID == "" {
+		var err error
+		keys, err = d.store.QueueKeys()
+		if err != nil {
+			return failure(err)
+		}
+	} else {
+		agent, err := d.herdr.GetAgent(ctx, paneID)
+		if err != nil {
+			return failure(err)
+		}
+		if agent == nil {
+			return failure(codedErrorf("agent_not_found", "agent %q was not found", paneID))
+		}
+		targetPane := agent.PaneID
+		if targetPane == "" {
+			targetPane = paneID
+		}
+		keys = append(keys, queueKey(targetPane))
+		if agent.Name != "" {
+			keys = append(keys, queueKey(agent.Name))
+		}
+	}
+
+	rows := make([]map[string]any, 0)
+	for _, key := range keys {
+		messages, names, err := d.store.ListLocalPending(key)
+		if err != nil {
+			return failure(err)
+		}
+		for i, message := range messages {
+			state := "pending"
+			if strings.HasPrefix(names[i], "claimed-") {
+				state = "claimed"
+			}
+			var lastError any
+			if message.LastError != "" {
+				lastError = message.LastError
+			}
+			rows = append(rows, map[string]any{
+				"queue": key, "id": message.ID, "from": message.From, "to": message.To,
+				"state": state, "ts": message.TS, "attempts": message.Attempts,
+				"last_error": lastError, "preview": inboxPreview(message.Body),
+			})
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		left, _ := rows[i]["ts"].(time.Time)
+		right, _ := rows[j]["ts"].(time.Time)
+		return left.Before(right)
+	})
+	return success(map[string]any{
+		"paused": d.isPaused(), "draft_holds": d.draftHoldStatus(), "rows": rows,
+	})
 }
 
 func (d *daemon) handleSend(ctx context.Context, req map[string]any) map[string]any {
@@ -826,6 +944,7 @@ func (d *daemon) handleStatus(ctx context.Context) map[string]any {
 	return success(map[string]any{
 		"host": d.cfg.Host, "uptime_s": int64(time.Since(d.started).Seconds()),
 		"herdr":  map[string]any{"version": d.version, "protocol": d.proto, "agents": d.agentCount()},
-		"queued": queued, "outbox": outbox, "links": links, "draft_holds": d.draftHoldStatus(),
+		"queued": queued, "outbox": outbox, "links": links, "paused": d.isPaused(),
+		"draft_holds": d.draftHoldStatus(),
 	})
 }

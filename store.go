@@ -146,6 +146,30 @@ func countPending(dir string) (int, error) {
 	return len(names), err
 }
 
+// ListLocalPending returns every pending or claimed local message in filename
+// order, paired with the spool filenames that describe each message's state.
+func (s *Store) ListLocalPending(key string) ([]Msg, []string, error) {
+	var messages []Msg
+	var names []string
+	err := s.withLock(func() error {
+		var err error
+		names, err = pendingNames(s.queueDir(key))
+		if err != nil {
+			return err
+		}
+		messages = make([]Msg, 0, len(names))
+		for _, name := range names {
+			message, err := readMsg(filepath.Join(s.queueDir(key), name))
+			if err != nil {
+				return fmt.Errorf("read queued message %s: %w", filepath.Join(s.queueDir(key), name), err)
+			}
+			messages = append(messages, *message)
+		}
+		return nil
+	})
+	return messages, names, err
+}
+
 func hasID(dir, id string) (bool, error) {
 	for _, name := range []string{"msg-*-" + id + ".json", "claimed-*-" + id + ".json"} {
 		matches, err := filepath.Glob(filepath.Join(dir, name))

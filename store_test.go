@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -167,5 +168,34 @@ func testStoreSenderRoundTrip(t *testing.T) {
 	}
 	if got := s.KnownSenderCount("ticket500"); got != 1 {
 		t.Fatalf("KnownSenderCount = %d", got)
+	}
+}
+
+func TestListLocalPendingIncludesPendingAndClaimedNames(t *testing.T) {
+	s := openTestStore(t)
+	first := testMsg("pending00001", "clem")
+	second := testMsg("pending00002", "clem")
+	second.TS = second.TS.Add(time.Second)
+	if err := s.EnqueueLocal(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnqueueLocal(second); err != nil {
+		t.Fatal(err)
+	}
+	if claim, err := s.ClaimLocal(queueKey("clem"), first.TS); err != nil || claim == nil {
+		t.Fatalf("ClaimLocal = %#v, %v", claim, err)
+	}
+	messages, names, err := s.ListLocalPending(queueKey("clem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 || len(names) != 2 {
+		t.Fatalf("ListLocalPending = %#v, %#v", messages, names)
+	}
+	if !strings.HasPrefix(names[0], "claimed-") || !strings.HasPrefix(names[1], "msg-") {
+		t.Fatalf("names = %v, want claimed then pending filename", names)
+	}
+	if messages[0].ID != first.ID || messages[1].ID != second.ID {
+		t.Fatalf("messages = %#v, want %q then %q", messages, first.ID, second.ID)
 	}
 }

@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-const version = "0.4.0"
+const version = "0.5.0"
 
 const usage = `Usage: tincan <command> [arguments]
 
@@ -22,6 +22,9 @@ Commands:
   name NAME                      Claim a stable name for this herdr pane
   whoami [--json]                Show this pane's tincan address
   status [--json]                Show daemon status and queue counts
+  inbox [--pane ID] [--json] [--watch]
+                                 Show pending local messages or run the inbox pane
+  pause [--on|--off|--toggle]    Pause, resume, or toggle delivery
   link                           Bridge standard input/output to the daemon link
   mcp                            Run the stdio MCP server
   version                        Print the tincan version
@@ -66,6 +69,10 @@ func main() {
 		err = cmdWhoami(os.Args[2:])
 	case "status":
 		err = cmdStatus(os.Args[2:])
+	case "inbox":
+		err = cmdInbox(os.Args[2:])
+	case "pause":
+		err = cmdPause(os.Args[2:])
 	case "link":
 		err = cmdLink(os.Args[2:])
 	case "mcp":

@@ -34,6 +34,7 @@ type herdrDriver interface {
 	PaneScreen(ctx context.Context, paneID string) (string, error)
 	Prompt(ctx context.Context, target, text string) error
 	Rename(ctx context.Context, target, name string) (*herdrAgent, error)
+	Notify(ctx context.Context, title, body string) error
 }
 
 type herdrWireRequest struct {
@@ -182,6 +183,15 @@ func (d *herdrSocket) Rename(ctx context.Context, target, name string) (*herdrAg
 		return nil, err
 	}
 	return decodeHerdrAgent(raw, "agent.rename")
+}
+
+func (d *herdrSocket) Notify(ctx context.Context, title, body string) error {
+	_, err := d.call(ctx, "notification.show", map[string]any{
+		"title": title,
+		"body":  body,
+		"sound": "none",
+	})
+	return err
 }
 
 func (d *herdrSocket) call(ctx context.Context, method string, params any) (json.RawMessage, error) {

@@ -1,0 +1,29 @@
+id = "tincan.inbox"
+name = "Tincan Inbox"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Held-message inbox and delivery control for the tincan gateway"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["tincan", "status"]
+
+[[panes]]
+id = "inbox"
+title = "Tincan inbox"
+placement = "popup"
+width = "80%"
+height = 20
+command = ["tincan", "inbox", "--watch"]
+
+[[actions]]
+id = "open-inbox"
+title = "Tincan inbox"
+contexts = ["workspace"]
+command = ["sh", "-c", "\"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin tincan.inbox --entrypoint inbox --placement popup"]
+
+[[actions]]
+id = "toggle-pause"
+title = "Tincan: pause/resume delivery"
+contexts = ["workspace"]
+command = ["tincan", "pause", "--toggle"]
