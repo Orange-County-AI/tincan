@@ -29,20 +29,19 @@ The daemon resolves identity from the calling pane when `HERDR_PANE_ID` is set; 
 
 ## Incoming `tincan/1` envelope
 
-A delivered message is terminal text in this fixed form. The body is inline, with `</tincan` neutralized so it cannot close the envelope.
+A delivered message is terminal text in this fixed form. The body and terse guidance note stay inside the element, with `</tincan` neutralized in the body so it cannot close the envelope. Nothing follows `</tincan>`.
 
 ```text
 <tincan from="jessica@titan" id="ab7e0e6bf59a" ts="2026-08-17T04:12:09Z" reply_to="c3621229db9f" schema="tincan/1">
 The ticket500 build is green.
+[reply if needed: tincan send jessica@titan "…" --reply-to ab7e0e6bf59a]
 </tincan>
-
-[tincan/1 — reply with: tincan send jessica@titan "…" --reply-to ab7e0e6bf59a (or the send_message tool if you have it). No reply needed? Ignore this; nothing is blocked on an ack.]
 ```
 
-`from` is a replyable address, `id` is the idempotency key, `ts` is the send time, and `reply_to` is present only for replies. Bodies are limited to 65,536 bytes when sent. The first 4,000 runes are injected; a longer body has `truncated="1"` and uses this trailer instead:
+`from` is a replyable address, `id` is the idempotency key, `ts` is the send time, and `reply_to` is present only for replies. Bodies are limited to 65,536 bytes when sent. The first 4,000 runes are injected; a longer body has `truncated="1"` and uses this final note instead:
 
 ```text
-[tincan/1 — body clipped at 4000 characters; read the rest with: tincan read ab7e0e6bf59a. Reply with: tincan send jessica@titan "…" --reply-to ab7e0e6bf59a (or the send_message tool if you have it).]
+[clipped; read: tincan read ab7e0e6bf59a; reply if needed: tincan send jessica@titan "…" --reply-to ab7e0e6bf59a]
 ```
 
 Use `tincan read <id>` (or `read_message`) to obtain the complete retained body.

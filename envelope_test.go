@@ -34,7 +34,7 @@ func TestRenderEnvelopeGolden(t *testing.T) {
 	ts := time.Date(2026, 8, 17, 4, 12, 9, 123, time.FixedZone("offset", -7*60*60))
 	t.Run("complete", func(t *testing.T) {
 		m := &Msg{ID: "ab7e0e6bf59a", From: "jessica@titan", Body: "hello", ReplyTo: "c3621229db9f", TS: ts}
-		want := "<tincan from=\"jessica@titan\" id=\"ab7e0e6bf59a\" ts=\"2026-08-17T11:12:09Z\" reply_to=\"c3621229db9f\" schema=\"tincan/1\">\nhello\n</tincan>\n\n[tincan/1 — reply with: tincan send jessica@titan \"…\" --reply-to ab7e0e6bf59a (or the send_message tool if you have it). No reply needed? Ignore this; nothing is blocked on an ack.]"
+		want := "<tincan from=\"jessica@titan\" id=\"ab7e0e6bf59a\" ts=\"2026-08-17T11:12:09Z\" reply_to=\"c3621229db9f\" schema=\"tincan/1\">\nhello\n[reply if needed: tincan send jessica@titan \"…\" --reply-to ab7e0e6bf59a]\n</tincan>"
 		if got := renderEnvelope(m); got != want {
 			t.Fatalf("envelope = %q\nwant %q", got, want)
 		}
@@ -43,10 +43,13 @@ func TestRenderEnvelopeGolden(t *testing.T) {
 		body := strings.Repeat("😀", maxInlineRunes+1)
 		m := &Msg{ID: "abc", From: "w7K:p1@titan", Body: body, TS: time.Date(2026, 8, 17, 4, 12, 9, 0, time.UTC)}
 		wantBody := strings.Repeat("😀", maxInlineRunes)
-		want := "<tincan from=\"w7K:p1@titan\" id=\"abc\" ts=\"2026-08-17T04:12:09Z\" truncated=\"1\" schema=\"tincan/1\">\n" + wantBody + "\n</tincan>\n\n[tincan/1 — body clipped at 4000 characters; read the rest with: tincan read abc. Reply with: tincan send w7K:p1@titan \"…\" --reply-to abc (or the send_message tool if you have it).]"
+		want := "<tincan from=\"w7K:p1@titan\" id=\"abc\" ts=\"2026-08-17T04:12:09Z\" truncated=\"1\" schema=\"tincan/1\">\n" + wantBody + "\n[clipped; read: tincan read abc; reply if needed: tincan send w7K:p1@titan \"…\" --reply-to abc]\n</tincan>"
 		got := renderEnvelope(m)
 		if got != want {
 			t.Fatalf("truncated envelope did not match golden string")
+		}
+		if !strings.HasSuffix(got, "</tincan>") {
+			t.Fatalf("text follows closing tag: %q", got)
 		}
 		if utf8.RuneCountInString(wantBody) != maxInlineRunes {
 			t.Fatal("test body was not rune exact")

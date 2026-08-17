@@ -12,8 +12,8 @@ const (
 	maxInlineRunes = 4000
 	maxBodyBytes   = 65536
 
-	replyTrailer     = "[tincan/1 — reply with: tincan send %s \"…\" --reply-to %s (or the send_message tool if you have it). No reply needed? Ignore this; nothing is blocked on an ack.]"
-	truncatedTrailer = "[tincan/1 — body clipped at %d characters; read the rest with: tincan read %s. Reply with: tincan send %s \"…\" --reply-to %s (or the send_message tool if you have it).]"
+	replyNote     = "[reply if needed: tincan send %s \"…\" --reply-to %s]"
+	truncatedNote = "[clipped; read: tincan read %s; reply if needed: tincan send %s \"…\" --reply-to %s]"
 )
 
 var attributeReplacer = strings.NewReplacer(
@@ -102,9 +102,9 @@ func renderEnvelope(m *Msg) string {
 	opening.WriteString(envelopeSchema)
 	opening.WriteString(`">`)
 
-	trailer := fmt.Sprintf(replyTrailer, m.From, m.ID)
+	note := fmt.Sprintf(replyNote, m.From, m.ID)
 	if truncated {
-		trailer = fmt.Sprintf(truncatedTrailer, maxInlineRunes, m.ID, m.From, m.ID)
+		note = fmt.Sprintf(truncatedNote, m.ID, m.From, m.ID)
 	}
-	return opening.String() + "\n" + body + "\n</tincan>\n\n" + trailer
+	return opening.String() + "\n" + body + "\n" + note + "\n</tincan>"
 }
