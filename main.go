@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-const version = "0.5.0"
+const version = "0.5.1"
 
 const usage = `Usage: tincan <command> [arguments]
 
@@ -43,7 +43,7 @@ func main() {
 
 	command := os.Args[1]
 	if command == "version" || command == "--version" || command == "-v" {
-		fmt.Println(version)
+		fmt.Println(buildVersion())
 		return
 	}
 	if command == "help" || command == "--help" || command == "-h" {

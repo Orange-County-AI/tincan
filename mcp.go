@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,11 +13,40 @@ import (
 )
 
 const mcpDefaultProtocolVersion = "2024-11-05"
-const mcpServerVersion = "0.2.0"
 
-// mcpPaneID is captured once when the MCP process starts. Tool arguments are
-// untrusted model input, so they cannot select or replace this identity.
-var mcpPaneID string
+// mcpServerVersion is the binary's own version including the commit it was built
+// from, not a second number to maintain: a probe that asks the MCP server what it
+// is must be able to tell which build it is talking to.
+func mcpServerVersion() string { return buildVersion() }
+
+// mcpPane holds this process's herdr pane, resolved per call rather than once at
+// startup. HERDR_PANE_ID is fixed at exec, but the pane it names is not: moving a
+// pane renumbers it, and a herdr restart can too. When the daemon then answers
+// agent_not_found, outbound calls fail while inbound delivery keeps working —
+// which reads as an agent ignoring you. So a not-found is treated as a stale
+// identity, re-resolved against herdr, and retried once.
+//
+// Tool arguments are untrusted model input and still cannot select or replace
+// this identity: re-resolution reads herdr, never the request.
+var mcpPane struct {
+	mu       sync.Mutex
+	resolved string
+}
+
+func mcpPaneID() string {
+	mcpPane.mu.Lock()
+	defer mcpPane.mu.Unlock()
+	if mcpPane.resolved != "" {
+		return mcpPane.resolved
+	}
+	return os.Getenv("HERDR_PANE_ID")
+}
+
+func mcpSetPaneID(paneID string) {
+	mcpPane.mu.Lock()
+	mcpPane.resolved = paneID
+	mcpPane.mu.Unlock()
+}
 
 func cmdMCP(args []string) error {
 	if len(args) != 0 {
@@ -68,7 +98,6 @@ func (w *mcpWriter) error(id json.RawMessage, code int, message string) {
 }
 
 func mcpServe(in io.Reader, out io.Writer) error {
-	mcpPaneID = os.Getenv("HERDR_PANE_ID")
 	writer := &mcpWriter{enc: json.NewEncoder(out)}
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -109,7 +138,7 @@ func mcpHandleRequest(writer *mcpWriter, req mcpRequest) {
 		writer.result(req.ID, map[string]any{
 			"protocolVersion": params.ProtocolVersion,
 			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": "tincan", "version": mcpServerVersion},
+			"serverInfo":      map[string]any{"name": "tincan", "version": mcpServerVersion()},
 			"instructions":    serverInstructions(),
 		})
 	case "ping":
@@ -211,12 +240,8 @@ func mcpDispatchTool(name string, raw json.RawMessage) (string, error) {
 		// Build a fresh map from the recognized schema fields. In particular,
 		// model-provided from and pane_id values never reach the daemon.
 		req := map[string]any{"op": "send", "to": args.To, "body": args.Message, "reply_to": args.ReplyTo}
-		req["pane_id"] = mcpPaneID
-		result, err := daemonCall(req)
+		result, err := mcpCallAsPane(req)
 		if err != nil {
-			return "", err
-		}
-		if err := mcpDaemonError(result); err != nil {
 			return "", err
 		}
 		text := fmt.Sprintf("Message %s queued for %s", mcpString(result, "id"), args.To)
@@ -268,12 +293,8 @@ func mcpDispatchTool(name string, raw json.RawMessage) (string, error) {
 			return "", err
 		}
 		req := map[string]any{"op": "name", "name": args.Name}
-		req["pane_id"] = mcpPaneID
-		result, err := daemonCall(req)
+		result, err := mcpCallAsPane(req)
 		if err != nil {
-			return "", err
-		}
-		if err := mcpDaemonError(result); err != nil {
 			return "", err
 		}
 		return "Claimed name: " + mcpString(result, "addr"), nil
@@ -283,12 +304,8 @@ func mcpDispatchTool(name string, raw json.RawMessage) (string, error) {
 			return "", err
 		}
 		req := map[string]any{"op": "whoami"}
-		req["pane_id"] = mcpPaneID
-		result, err := daemonCall(req)
+		result, err := mcpCallAsPane(req)
 		if err != nil {
-			return "", err
-		}
-		if err := mcpDaemonError(result); err != nil {
 			return "", err
 		}
 		return mcpFormatWhoami(result), nil
@@ -319,6 +336,71 @@ func mcpDaemonError(result map[string]any) error {
 		return fmt.Errorf("%s", code)
 	}
 	return fmt.Errorf("daemon returned an invalid response")
+}
+
+// mcpCallAsPane runs an op that carries this process's identity. On
+// agent_not_found it re-resolves the pane from herdr once and retries, so a pane
+// move or a herdr restart stops presenting as an agent that has gone silent.
+func mcpCallAsPane(req map[string]any) (map[string]any, error) {
+	req["pane_id"] = mcpPaneID()
+	result, err := daemonCall(req)
+	if err != nil {
+		return nil, err
+	}
+	callErr := mcpDaemonError(result)
+	if callErr == nil || mcpString(result, "code") != "agent_not_found" {
+		return result, callErr
+	}
+	paneID, resolveErr := mcpResolvePane()
+	if resolveErr != nil {
+		return nil, fmt.Errorf("%s; re-resolving this pane also failed: %v", callErr, resolveErr)
+	}
+	if paneID == req["pane_id"] {
+		return nil, callErr
+	}
+	mcpSetPaneID(paneID)
+	req["pane_id"] = paneID
+	result, err = daemonCall(req)
+	if err != nil {
+		return nil, err
+	}
+	return result, mcpDaemonError(result)
+}
+
+// mcpResolvePane finds the pane this process actually lives in, by asking herdr
+// for the agent whose working directory matches ours. A pane move renumbers the
+// pane but does not move the agent, so cwd survives exactly the events that
+// invalidate HERDR_PANE_ID. An ambiguous match is reported rather than guessed:
+// sending as the wrong agent is worse than failing to send.
+func mcpResolvePane() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("read working directory: %w", err)
+	}
+	socket, err := herdrSocketPath(nil)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), herdrSocketIOTimeout)
+	defer cancel()
+	agents, err := newHerdrSocket(socket, func(string) {}).ListAgents(ctx)
+	if err != nil {
+		return "", fmt.Errorf("list herdr agents: %w", err)
+	}
+	var matches []string
+	for _, agent := range agents {
+		if agent.CWD == cwd && agent.PaneID != "" {
+			matches = append(matches, agent.PaneID)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return "", fmt.Errorf("no herdr agent runs in %s", cwd)
+	default:
+		return "", fmt.Errorf("%d herdr agents run in %s (%s); claim a name so this pane has a stable address", len(matches), cwd, strings.Join(matches, ", "))
+	}
 }
 
 func mcpString(result map[string]any, key string) string {

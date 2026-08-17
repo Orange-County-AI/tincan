@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -39,7 +41,7 @@ func TestMCPInitializeProtocolVersion(t *testing.T) {
 			if got := stringValue(t, serverInfo, "name"); got != "tincan" {
 				t.Fatalf("server name = %q", got)
 			}
-			if got := stringValue(t, serverInfo, "version"); got != mcpServerVersion {
+			if got := stringValue(t, serverInfo, "version"); got != mcpServerVersion() {
 				t.Fatalf("server version = %q", got)
 			}
 			instructions := stringValue(t, result, "instructions")
@@ -284,4 +286,135 @@ func stringSlice(value any) []string {
 		values = append(values, value)
 	}
 	return values
+}
+
+// startHerdrForMCP points HERDR_SOCKET_PATH at a fake herdr whose agent.list
+// answers the given agents, which is how mcpResolvePane finds this process.
+func startHerdrForMCP(t *testing.T, agents []any) {
+	t.Helper()
+	server := startHerdrTestServer(t, 19, func(request herdrWireRequest) herdrTestReply {
+		switch request.Method {
+		case "ping":
+			return herdrTestReply{result: map[string]any{"type": "pong", "protocol": 19, "version": "0.8.0"}}
+		case "agent.list":
+			return herdrTestReply{result: map[string]any{"type": "agent_list", "agents": agents}}
+		default:
+			return herdrTestReply{err: &herdrAPIError{Code: "bad_request", Message: request.Method}}
+		}
+	})
+	t.Setenv("HERDR_SOCKET_PATH", server.listener.Addr().String())
+}
+
+func TestMCPSendReresolvesPaneAfterAgentNotFound(t *testing.T) {
+	// The pane moved: the id in the environment is gone and herdr now reports
+	// this agent under a different one. Outbound must heal instead of looking
+	// like an agent that stopped answering.
+	t.Setenv("HERDR_PANE_ID", "w5B:p4")
+	t.Cleanup(func() { mcpSetPaneID("") })
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	startHerdrForMCP(t, []any{
+		map[string]any{"agent": "omp", "agent_status": "idle", "cwd": "/somewhere/else", "pane_id": "w9:p9"},
+		map[string]any{"agent": "omp", "agent_status": "idle", "cwd": cwd, "pane_id": "w7N:p8"},
+	})
+
+	seen := make(chan string, 4)
+	startMCPDaemon(t, func(request map[string]any) map[string]any {
+		paneID, _ := request["pane_id"].(string)
+		seen <- paneID
+		if paneID != "w7N:p8" {
+			return map[string]any{"ok": false, "code": "agent_not_found", "error": "agent " + paneID + " was not found"}
+		}
+		return map[string]any{"ok": true, "id": "abc123", "route": "local"}
+	})
+
+	response := mcpRoundTrip(t, map[string]any{
+		"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "send_message",
+			"arguments": map[string]any{"to": "clem", "message": "hello"},
+		},
+	})
+	result := mcpResult(t, response)
+	if isError, _ := result["isError"].(bool); isError {
+		t.Fatalf("send failed after re-resolution: %#v", result)
+	}
+	close(seen)
+	var attempts []string
+	for paneID := range seen {
+		attempts = append(attempts, paneID)
+	}
+	if len(attempts) != 2 || attempts[0] != "w5B:p4" || attempts[1] != "w7N:p8" {
+		t.Fatalf("pane ids tried = %v, want the stale one then the re-resolved one", attempts)
+	}
+	// The healed identity sticks, so the next call does not pay for it again.
+	if got := mcpPaneID(); got != "w7N:p8" {
+		t.Fatalf("mcpPaneID() = %q, want the re-resolved pane", got)
+	}
+}
+
+func TestMCPSendRefusesToGuessAnAmbiguousPane(t *testing.T) {
+	t.Setenv("HERDR_PANE_ID", "w5B:p4")
+	t.Cleanup(func() { mcpSetPaneID("") })
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two agents in one directory: sending as the wrong one is worse than failing.
+	startHerdrForMCP(t, []any{
+		map[string]any{"agent": "omp", "cwd": cwd, "pane_id": "w1:p1"},
+		map[string]any{"agent": "omp", "cwd": cwd, "pane_id": "w2:p1"},
+	})
+	startMCPDaemon(t, func(map[string]any) map[string]any {
+		return map[string]any{"ok": false, "code": "agent_not_found", "error": "agent w5B:p4 was not found"}
+	})
+
+	response := mcpRoundTrip(t, map[string]any{
+		"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "send_message",
+			"arguments": map[string]any{"to": "clem", "message": "hello"},
+		},
+	})
+	result := mcpResult(t, response)
+	if isError, _ := result["isError"].(bool); !isError {
+		t.Fatalf("ambiguous re-resolution reported success: %#v", result)
+	}
+	if got := mcpPaneID(); got != "w5B:p4" {
+		t.Fatalf("mcpPaneID() = %q, want the environment pane to stand after an ambiguous match", got)
+	}
+}
+
+func TestMCPServerVersionTracksTheBinaryAndItsCommit(t *testing.T) {
+	// A probe must be able to tell which BUILD it is talking to: this fleet has
+	// binaries whose semver constant lies about what they contain, and md5 was the
+	// only reliable handle. So the reported version carries the commit too.
+	reported := mcpServerVersion()
+	if !strings.HasPrefix(reported, version+" (") || !strings.HasSuffix(reported, ")") {
+		t.Fatalf("mcpServerVersion() = %q, want %q followed by a revision", reported, version)
+	}
+	response := mcpRoundTrip(t, map[string]any{"jsonrpc": "2.0", "id": 8, "method": "initialize"})
+	info := objectValue(t, mcpResult(t, response), "serverInfo")
+	if got := stringValue(t, info, "version"); got != reported {
+		t.Fatalf("initialize serverInfo.version = %q, want %q", got, reported)
+	}
+}
+
+func TestBuildVersionReportsRevisionAndDirtyState(t *testing.T) {
+	revision, _ := buildRevision()
+	reported := buildVersion()
+	if revision == "" {
+		if reported != version+" (unknown revision)" {
+			t.Fatalf("buildVersion() = %q with no VCS stamp", reported)
+		}
+		return
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	if !strings.Contains(reported, revision) {
+		t.Fatalf("buildVersion() = %q, want it to name revision %s", reported, revision)
+	}
 }

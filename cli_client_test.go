@@ -63,3 +63,79 @@ func TestRunInboxErrorRendersAndStillExits(t *testing.T) {
 		t.Fatalf("frame = %q", got)
 	}
 }
+
+// A body the shell split into words used to be sent as its first word, with the
+// remainder discarded and the caller told it succeeded. Refusing is the fix:
+// silent truncation of a message is worse than a failed send.
+func TestSendRefusesExtraPositionalsInsteadOfTruncating(t *testing.T) {
+	// A fake socket so a future refactor that moves the guard after the daemon
+	// call cannot make this test send anything real.
+	startMCPDaemon(t, func(map[string]any) map[string]any {
+		t.Error("a refused command reached the daemon")
+		return map[string]any{"ok": true}
+	})
+	err := cmdSend([]string{"clem", "first sentence.", "second", "sentence."})
+	if err == nil {
+		t.Fatal("cmdSend accepted a shell-split body")
+	}
+	if !strings.Contains(err.Error(), "exactly one message") || !strings.Contains(err.Error(), "quote the body") {
+		t.Fatalf("error = %q, want it to name the cause and the fix", err)
+	}
+	// Every sibling subcommand already guards this way; send was the exception.
+	for name, call := range map[string]func([]string) error{
+		"agents": cmdAgents, "status": cmdStatus, "inbox": cmdInbox, "pause": cmdPause,
+	} {
+		if err := call([]string{"stray"}); err == nil {
+			t.Errorf("%s accepted a stray positional", name)
+		}
+	}
+}
+
+func TestSendFlagsStillParseAfterTheGuard(t *testing.T) {
+	// A fake daemon socket, because cmdSend really sends: without this the test
+	// enqueues junk to a live agent and depends on production state.
+	sent := make(chan map[string]any, 4)
+	startMCPDaemon(t, func(request map[string]any) map[string]any {
+		sent <- request
+		return map[string]any{"ok": true, "id": "test-id", "route": "local"}
+	})
+	// The guard must not reject the legitimate flag forms, which sit after the
+	// body and are what fs.Parse(args[2:]) exists for.
+	for _, args := range [][]string{
+		{"clem", "body", "--reply-to", "abc123"},
+		{"clem", "body"},
+	} {
+		if err := cmdSend(args); err != nil {
+			t.Fatalf("cmdSend(%v) rejected a valid form: %v", args, err)
+		}
+	}
+	close(sent)
+	var bodies []string
+	for request := range sent {
+		body, _ := request["body"].(string)
+		bodies = append(bodies, body)
+	}
+	if len(bodies) != 2 || bodies[0] != "body" || bodies[1] != "body" {
+		t.Fatalf("bodies sent = %#v, want the whole body once per valid form", bodies)
+	}
+}
+
+func TestSendRefusesFromInsideAPane(t *testing.T) {
+	// --from names a sender, so inside a pane it would let a caller impersonate
+	// another agent; identity comes from the pane instead.
+	t.Setenv("HERDR_PANE_ID", "w7V:p1")
+	startMCPDaemon(t, func(map[string]any) map[string]any {
+		t.Error("cmdSend reached the daemon with --from inside a pane")
+		return map[string]any{"ok": true}
+	})
+	err := cmdSend([]string{"clem", "body", "--from", "ci"})
+	if err == nil || !strings.Contains(err.Error(), "--from is not allowed inside a herdr pane") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSendEchoFlattensTheBodyToOneLine(t *testing.T) {
+	if got := sendEcho("first line\n\nsecond   line\t"); got != "first line second line" {
+		t.Fatalf("sendEcho = %q", got)
+	}
+}

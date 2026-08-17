@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 func newFlagSet(name string) *flag.FlagSet {
@@ -28,6 +29,13 @@ func cmdSend(args []string) error {
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
 	}
+	// Go's flag package stops at the first non-flag token and leaves the rest in
+	// Args(). Without this guard a body the shell split into words is sent as its
+	// first word, the remainder is discarded, and the caller is told it succeeded
+	// — a silently truncated message is worse than a refused one.
+	if fs.NArg() != 0 {
+		return fmt.Errorf("send takes exactly one message; %d extra argument(s) after it (quote the body: tincan send %s \"...\")", fs.NArg(), to)
+	}
 	paneID := os.Getenv("HERDR_PANE_ID")
 	if paneID != "" && *from != "" {
 		return fmt.Errorf("--from is not allowed inside a herdr pane: identity comes from the pane")
@@ -37,12 +45,22 @@ func cmdSend(args []string) error {
 		return err
 	}
 	return printResult(res, false, func(res map[string]any) string {
-		text := fmt.Sprintf("Message %s to %q via %s.", valueString(res, "id"), to, valueString(res, "route"))
+		// Echoing what was actually sent makes a mis-quoted body obvious at the
+		// moment it happens rather than several messages later.
+		text := fmt.Sprintf("Message %s to %q via %s (%d chars): %s",
+			valueString(res, "id"), to, valueString(res, "route"),
+			utf8.RuneCountInString(body), truncateInbox(sendEcho(body), 60))
 		if warn := valueString(res, "warn"); warn != "" {
 			text += "\n" + warn
 		}
 		return text
 	})
+}
+
+// sendEcho flattens the body to one line so the confirmation stays a single line
+// whatever the message looked like.
+func sendEcho(body string) string {
+	return strings.Join(strings.Fields(body), " ")
 }
 
 func cmdAgents(args []string) error {
