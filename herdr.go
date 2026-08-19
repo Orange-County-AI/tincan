@@ -32,6 +32,7 @@ type herdrDriver interface {
 	ListAgents(ctx context.Context) ([]herdrAgent, error)
 	GetAgent(ctx context.Context, target string) (*herdrAgent, error)
 	PaneScreen(ctx context.Context, paneID string) (string, error)
+	SendKeys(ctx context.Context, paneID string, keys []string) error
 	Prompt(ctx context.Context, target, text string) error
 	Rename(ctx context.Context, target, name string) (*herdrAgent, error)
 	Notify(ctx context.Context, title, body string) error
@@ -75,6 +76,9 @@ type herdrSocket struct {
 	logf              func(string)
 	acceptedProtocols map[int]struct{}
 
+	stallPollAttempts int
+	stallPollInterval time.Duration
+
 	mu             sync.Mutex
 	nextID         uint64
 	loggedProtocol bool
@@ -100,6 +104,8 @@ func newHerdrSocket(path string, logf func(string)) *herdrSocket {
 		path:              path,
 		logf:              logf,
 		acceptedProtocols: accepted,
+		stallPollAttempts: 15,
+		stallPollInterval: time.Second,
 	}
 }
 
@@ -168,13 +174,60 @@ func (d *herdrSocket) PaneScreen(ctx context.Context, paneID string) (string, er
 	return result.Read.Text, nil
 }
 
+func (d *herdrSocket) SendKeys(ctx context.Context, paneID string, keys []string) error {
+	_, err := d.call(ctx, "pane.send_keys", map[string]any{"pane_id": paneID, "keys": keys})
+	return err
+}
+
 func (d *herdrSocket) Prompt(ctx context.Context, target, text string) error {
 	raw, err := d.call(ctx, "agent.prompt", map[string]any{"target": target, "text": text})
 	if err != nil {
+		if codeOf(err) == "agent_prompt_stalled" && d.flushPastedPrompt(ctx, target) {
+			d.logf(fmt.Sprintf("flushed a stalled prompt to %s with one Enter", target))
+			return nil
+		}
 		return err
 	}
 	_, err = decodeHerdrAgentOfType(raw, "agent.prompt", "agent_prompted")
 	return err
+}
+
+// flushPastedPrompt recovers a prompt herdr reported stalled. A large
+// bracketed paste can collapse into an OMP attachment chip, and the collapse
+// absorbs herdr's submit key, so the envelope sits unsent in the composer.
+// One Enter submits it, and is harmless if the composer turned out to be
+// empty, which is why it is the whole recovery. Accepting the key proves
+// nothing though: only a moved state_change_seq proves the agent took the
+// prompt, so every failed precondition reports false and leaves the original
+// stall as the reported cause.
+func (d *herdrSocket) flushPastedPrompt(ctx context.Context, target string) bool {
+	agent, err := d.GetAgent(ctx, target)
+	if err != nil || agent == nil || agent.PaneID == "" {
+		return false
+	}
+	before := agent.StateChangeSeq
+	if err := d.SendKeys(ctx, agent.PaneID, []string{"Enter"}); err != nil {
+		return false
+	}
+	for range d.stallPollAttempts {
+		timer := time.NewTimer(d.stallPollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return false
+		case <-timer.C:
+		}
+		now, err := d.GetAgent(ctx, target)
+		if err != nil || now == nil {
+			return false
+		}
+		if now.StateChangeSeq != before {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *herdrSocket) Rename(ctx context.Context, target, name string) (*herdrAgent, error) {

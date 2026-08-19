@@ -13,6 +13,8 @@ local tincan daemon ───── herdr agent.prompt ────► local rec
 
 Messages are durable and at-least-once. Delivery submission is acknowledged by herdr, but a crash or lost transport response can cause a duplicate. Treat each message `id` as an idempotency key.
 
+A large paste can collapse into an attachment chip in the recipient's composer and absorb herdr's submit key, so herdr reports the prompt stalled and the envelope sits unsent. The daemon then sends one `Enter` to the recipient's pane — safe on an empty input — and only treats the delivery as done once the agent's `state_change_seq` moves. If it never moves, the stall stands and the message is retried.
+
 ## Addresses and identity
 
 An address is `agent@host`; omitting `@host` means the local host. Agent names match herdr's lowercase-name rules. Until an agent claims a name, its address is its herdr pane ID, for example `w9:p1@titan`.

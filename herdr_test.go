@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type herdrTestReply struct {
@@ -262,6 +263,143 @@ func TestHerdrPrompt(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func herdrTestAgentInfo(paneID string, seq uint64) map[string]any {
+	return map[string]any{
+		"type": "agent_info",
+		"agent": map[string]any{
+			"agent":            "omp",
+			"pane_id":          paneID,
+			"agent_status":     "idle",
+			"state_change_seq": seq,
+		},
+	}
+}
+
+func countHerdrMethod(methods []string, method string) int {
+	count := 0
+	for _, seen := range methods {
+		if seen == method {
+			count++
+		}
+	}
+	return count
+}
+
+// herdrStallRecorder answers a stalled agent.prompt and records what the
+// recovery did. seqs supplies one state_change_seq per agent.get, the last
+// value repeating, so a test says "frozen" or "moved" by listing sequences.
+func herdrStallRecorder(t *testing.T, paneID string, sendKeysErr *herdrAPIError, seqs ...uint64) (*herdrSocket, func() ([]string, []string)) {
+	t.Helper()
+	var mu sync.Mutex
+	var methods []string
+	var sentKeys []string
+	gets := 0
+	driver := newHerdrTestDriver(t, 19, func(request herdrWireRequest) herdrTestReply {
+		mu.Lock()
+		defer mu.Unlock()
+		methods = append(methods, request.Method)
+		params, _ := request.Params.(map[string]any)
+		switch request.Method {
+		case "agent.prompt":
+			return herdrTestReply{err: &herdrAPIError{Code: "agent_prompt_stalled", Message: "no state change within 5000ms"}}
+		case "agent.get":
+			seq := seqs[min(gets, len(seqs)-1)]
+			gets++
+			return herdrTestReply{result: herdrTestAgentInfo(paneID, seq)}
+		case "pane.send_keys":
+			if params["pane_id"] != paneID {
+				t.Errorf("pane.send_keys params = %#v, want pane %q", params, paneID)
+			}
+			keys, _ := params["keys"].([]any)
+			for _, key := range keys {
+				name, _ := key.(string)
+				sentKeys = append(sentKeys, name)
+			}
+			if sendKeysErr != nil {
+				return herdrTestReply{err: sendKeysErr}
+			}
+			return herdrTestReply{result: map[string]any{"type": "ok"}}
+		default:
+			t.Errorf("unexpected method %q", request.Method)
+			return herdrTestReply{}
+		}
+	})
+	driver.stallPollInterval = time.Millisecond
+	driver.stallPollAttempts = 3
+	return driver, func() ([]string, []string) {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), methods...), append([]string(nil), sentKeys...)
+	}
+}
+
+func TestHerdrPromptStallSendsOneEnterAndConfirmsMovement(t *testing.T) {
+	driver, recorded := herdrStallRecorder(t, "w1:p1", nil, 7, 8)
+	if err := driver.Prompt(context.Background(), "agent-a", "a 169-line envelope"); err != nil {
+		t.Fatalf("Prompt() error = %v, want recovered stall", err)
+	}
+	methods, sentKeys := recorded()
+	if len(sentKeys) != 1 || sentKeys[0] != "Enter" {
+		t.Fatalf("sent keys = %v, want one Enter", sentKeys)
+	}
+	if countHerdrMethod(methods, "agent.prompt") != 1 {
+		t.Fatalf("methods = %v, want a single agent.prompt", methods)
+	}
+	if got := countHerdrMethod(methods, "agent.get"); got != 2 {
+		t.Fatalf("agent.get count = %d, want pre-read plus one confirming poll", got)
+	}
+}
+
+func TestHerdrPromptStallKeepsOriginalErrorWhenRecoveryIsNotDefinitive(t *testing.T) {
+	tests := []struct {
+		name        string
+		paneID      string
+		sendKeysErr *herdrAPIError
+		seqs        []uint64
+		wantKeys    int
+		wantGets    int
+	}{
+		{name: "frozen sequence never proves delivery", paneID: "w1:p1", seqs: []uint64{7}, wantKeys: 1, wantGets: 4},
+		{name: "no pane id means no key to send", paneID: "", seqs: []uint64{7}, wantKeys: 0, wantGets: 1},
+		{name: "refused key stops the recovery", paneID: "w1:p1", sendKeysErr: &herdrAPIError{Code: "pane_not_found", Message: "no pane"}, seqs: []uint64{7}, wantKeys: 1, wantGets: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			driver, recorded := herdrStallRecorder(t, tt.paneID, tt.sendKeysErr, tt.seqs...)
+			err := driver.Prompt(context.Background(), "agent-a", "a 169-line envelope")
+			if codeOf(err) != "agent_prompt_stalled" {
+				t.Fatalf("Prompt() error = %v, code = %q, want the original stall", err, codeOf(err))
+			}
+			methods, sentKeys := recorded()
+			if len(sentKeys) != tt.wantKeys {
+				t.Fatalf("sent keys = %v, want %d", sentKeys, tt.wantKeys)
+			}
+			if got := countHerdrMethod(methods, "agent.get"); got != tt.wantGets {
+				t.Fatalf("agent.get count = %d, want %d (methods %v)", got, tt.wantGets, methods)
+			}
+		})
+	}
+}
+
+func TestHerdrPromptFlushOnlyAttemptedForStall(t *testing.T) {
+	var mu sync.Mutex
+	var methods []string
+	driver := newHerdrTestDriver(t, 19, func(request herdrWireRequest) herdrTestReply {
+		mu.Lock()
+		defer mu.Unlock()
+		methods = append(methods, request.Method)
+		return herdrTestReply{err: &herdrAPIError{Code: "agent_not_found", Message: "no agent named agent-a"}}
+	})
+	if err := driver.Prompt(context.Background(), "agent-a", "hello"); codeOf(err) != "agent_not_found" {
+		t.Fatalf("Prompt() error = %v, code = %q, want agent_not_found", err, codeOf(err))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(methods) != 1 || methods[0] != "agent.prompt" {
+		t.Fatalf("methods = %v, want only agent.prompt", methods)
 	}
 }
 

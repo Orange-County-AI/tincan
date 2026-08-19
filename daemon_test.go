@@ -18,6 +18,11 @@ type recordedPrompt struct {
 	text   string
 }
 
+type recordedKeys struct {
+	paneID string
+	keys   []string
+}
+
 type fakeDaemonHerdr struct {
 	mu            sync.Mutex
 	agents        []herdrAgent
@@ -25,6 +30,8 @@ type fakeDaemonHerdr struct {
 	promptErr     error
 	paneScreens   map[string]string
 	paneScreenErr error
+	sentKeys      []recordedKeys
+	sendKeysErr   error
 	notifications []recordedNotification
 	notifyErr     error
 }
@@ -60,6 +67,13 @@ func (f *fakeDaemonHerdr) PaneScreen(_ context.Context, paneID string) (string, 
 		return "", errors.New("pane screen not configured")
 	}
 	return screen, nil
+}
+
+func (f *fakeDaemonHerdr) SendKeys(_ context.Context, paneID string, keys []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sentKeys = append(f.sentKeys, recordedKeys{paneID: paneID, keys: append([]string(nil), keys...)})
+	return f.sendKeysErr
 }
 
 func (f *fakeDaemonHerdr) Prompt(_ context.Context, target, text string) error {
